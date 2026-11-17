@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+models/
+results.json
+samples/**/*.wav
+samples/**/*.aiff
+samples/**/*.m4a
+samples/**/*.mp3
+.DS_Store
