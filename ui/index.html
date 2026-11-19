@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lyra — your private voice assistant</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🎙 Lyra</div>
+    <div class="top-right">
+      <span class="status-pill" id="status">Idle</span>
+      <span class="dot" id="conn-dot" title="connection"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT -->
+    <div class="col-main">
+      <section class="hero">
+        <div class="orb" id="orb">
+          <span class="orb-ring"></span>
+          <span class="orb-ring delay"></span>
+          <div class="orb-core" id="orb-core">🎙</div>
+        </div>
+        <h1 id="hero-title">Talk to Lyra</h1>
+        <p class="sub" id="hero-sub">Enrol once, then say “Hey Lyra” to start. I only answer you, and I decide 2 seconds after you stop speaking.</p>
+        <button class="btn big primary" id="btn-listen">▶ Start listening</button>
+
+        <div class="hero-status">
+          <span class="speech-dot" id="speech-dot"></span>
+          <span id="speech-text">microphone</span>
+          <div class="meter"><div class="meter-fill" id="live-level"></div></div>
+          <span id="mic-db" class="mic-db">— dB</span>
+        </div>
+        <div class="capture" id="capture" hidden>
+          <div class="capture-head">
+            <span class="capture-title" id="capture-title">Capturing your speech…</span>
+            <span class="capture-time" id="capture-time">0.0 s</span>
+          </div>
+          <div class="capture-bar"><div class="capture-fill" id="capture-fill"></div></div>
+          <div class="capture-note" id="capture-note">The bot decides 2 seconds after you stop talking.</div>
+        </div>
+        <div class="mic-warning" id="mic-warning" hidden>⚠ Mic level looks low — speak louder, move closer, or check your input device.</div>
+
+        <div class="score-block" id="score-block" hidden>
+          <div class="score-label">Voice match: <b id="score-label">—</b></div>
+          <div class="score-track">
+            <div class="score-fill" id="score-fill"></div>
+            <div class="score-thresh" id="score-thresh"></div>
+          </div>
+          <div class="score-hint">owner = 35% or higher</div>
+        </div>
+      </section>
+
+      <section class="steps" id="steps">
+        <div class="step" data-step="1">
+          <span class="num">1</span>
+          <div><b>Enrol your voice</b><small>Your name first · 10 spoken lines</small></div>
+        </div>
+        <div class="step" data-step="2">
+          <span class="num">2</span>
+          <div><b>Check your mic</b><small>4-second test · see your match score</small></div>
+        </div>
+        <div class="step" data-step="3">
+          <span class="num">3</span>
+          <div><b>Say “Hey Lyra”</b><small>I answer only when it is you</small></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Conversation</h2></div>
+        <div class="conversation" id="conversation">
+          <div class="empty">Nothing yet — press <b>Start listening</b> and speak.</div>
+        </div>
+      </section>
+    </div>
+
+    <!-- RIGHT -->
+    <div class="col-side">
+      <section class="card">
+        <div class="card-head">
+          <h2>Your voice</h2>
+          <span class="pill" id="vp-pill">not enrolled</span>
+        </div>
+        <p class="hint" id="vp-meta">Enrol once so the assistant only answers you.</p>
+        <div class="btn-row">
+          <button class="btn primary" id="btn-enrol">🎙 Enrol my voice</button>
+          <button class="btn" id="btn-add">Add samples</button>
+          <button class="btn" id="btn-restore" hidden>Restore</button>
+          <button class="btn danger" id="btn-delete">Delete</button>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn" id="btn-miccheck">🎤 Mic check (4 s)</button>
+        </div>
+        <div class="miccheck-out" id="miccheck-out" hidden></div>
+        <label class="consent">
+          <input type="checkbox" id="enrol-consent" />
+          I understand my voice stays on this device and is never uploaded.
+        </label>
+      </section>
+
+      <section class="card" id="enrol-card" hidden>
+        <div class="card-head">
+          <h2>Enrolment</h2>
+          <button class="btn ghost" id="btn-cancel">cancel</button>
+        </div>
+        <div class="progress"><div class="progress-bar" id="enrol-progress"></div></div>
+
+        <div id="name-stage" hidden>
+          <div class="prompt-count">First question</div>
+          <div class="read-label">I will ask you out loud. Answer when you hear it:</div>
+          <div class="name-question" id="name-question">🎙 “What is your name?”</div>
+          <div class="hint">Say it naturally, for example “My name is Adnan.”</div>
+        </div>
+
+        <div id="prompt-stage">
+          <div class="prompt-count" id="prompt-count">Prompt 1 of 10</div>
+          <div class="read-label">Read this aloud:</div>
+          <div class="prompt-line" id="prompt-line"></div>
+          <div class="prompt-tone" id="enrol-tone"></div>
+        </div>
+
+        <div class="rec-row">
+          <button class="btn rec" id="btn-record">● Tap to record</button>
+          <div class="meter grow"><div class="meter-fill" id="record-level"></div></div>
+          <span class="rec-time" id="record-time"></span>
+        </div>
+        <div class="enrol-dots" id="enrol-dots"></div>
+        <div class="result" id="enrol-result"></div>
+      </section>
+
+      <details class="card settings">
+        <summary>⚙ Settings</summary>
+        <div class="settings-grid">
+          <label class="field">Stop after (minutes)
+            <input type="range" id="timeout" min="1" max="60" step="1" />
+            <output id="timeout-out"></output>
+          </label>
+          <label class="toggle"><input type="checkbox" id="timeout-enabled" /> auto-sleep when idle</label>
+          <label class="toggle"><input type="checkbox" id="saveutt" /> save audio to <code>debug/</code></label>
+        </div>
+      </details>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+  <div class="toast" id="toast" hidden></div>
+</body>
+</html>

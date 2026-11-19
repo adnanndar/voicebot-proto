@@ -11,3 +11,19 @@ silero-vad>=5.1
 faster-whisper>=1.0
 # resemblyzer -> webrtcvad imports pkg_resources, which setuptools >=81 no longer ships
 setuptools<81
+
+# app (tickets 2-5) — live capture + noise suppression
+sounddevice>=0.4        # needs PortAudio: brew install portaudio
+noisereduce>=3.0        # spectral noise gate (stand-in for RNNoise/WebRTC)
+# ui (ticket 7) — FastAPI + WebSocket live panel
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12
+# brain (ticket 5) — hosted Claude (best quality when a key is set)
+anthropic>=0.40
+# brain (ticket 5) — local answer model on Apple Silicon (brain: auto)
+mlx-lm>=0.20; sys_platform == "darwin" and platform_machine == "arm64"
+# privacy (ticket 8) — Fernet encryption at rest (key in macOS Keychain)
+cryptography>=41
+# eval (ticket 6) — ROC/DET plots (optional; CSV still written without it)
+matplotlib>=3.7

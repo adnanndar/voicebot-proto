@@ -5,6 +5,11 @@ __pycache__/
 .env
 models/
 results.json
+tmp/
+data/
+debug/
+eval_scores.csv
+eval_roc.png
 samples/**/*.wav
 samples/**/*.aiff
 samples/**/*.m4a

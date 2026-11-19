@@ -1,0 +1,73 @@
+# voicebot-proto — runtime settings (tickets 2–5).
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  blocksize: 512          # 32 ms @ 16 kHz
+  device: null            # null = default mic (see: python -m sounddevice)
+  noise_suppression: false # optional spectral gate; the adaptive VAD gate is on by default
+  ns_chunk_sec: 0.5
+  ns_prop_decrease: 0.85  # denoise strength (0..1)
+  ns_profile_sec: 0       # 0 = don't subtract a learned profile (safer for VAD)
+  gain_db: 0              # extra gain before VAD; 0 works best with normal mics
+
+vad:
+  threshold: 0.5
+  start_ms: 300           # speech needed to open an utterance
+  end_ms: 2000            # decide once the speaker has been silent for 2 s
+  max_sec: 30             # backstop: never let one utterance stay open forever
+  pre_roll_ms: 600        # keep before speech so first words aren't clipped
+  noise_gate_ratio: 2.0   # ignore anything within 2x the background noise floor
+
+speaker:
+  model: ecapa            # ecapa | resemblyzer
+  adaptive:               # ticket 8: slowly adapt the voiceprint to drift
+    enabled: true
+    weight: 0.02          # EMA weight (kept small)
+    min_score: 0.45       # adapt only on utterances clearly above the 35% rule
+
+privacy:
+  encrypt: true           # Fernet + macOS Keychain at rest
+  require_consent: true   # show consent before enrolment
+
+gate:
+  accept_threshold: 0.35  # >= 35% similarity -> owner
+  reject_threshold: 0.35  # < 35% -> not owner
+  min_utterance_sec: 0.5  # below this scores are unreliable
+  conversation_window_sec: 20
+  followup_score: 0.18   # unused: every utterance must still pass accept_threshold
+  conversation_hold_sec: 300  # unused: kept for config compatibility
+  lockout_after: 5       # unrecognised attempts before a short pause
+  lockout_window_sec: 60 # attempts counted within this many seconds
+  lockout_sec: 60        # pause length after repeated unknown voices
+  # Every utterance is scored as ONE whole recording (the full speech, after the
+  # speaker has been silent for 2 s). Sliding windows are not used because they
+  # produced lower scores for the same owner speech.
+
+timeout:
+  enabled: true
+  minutes: 2              # go to standby after this long with no owner interaction
+
+enrol:
+  min_speech_sec: 0.8
+  min_duration_sec: 1.0
+  min_level_db: -40
+  min_snr_db: 6
+  outlier_drop_gap: 0.15
+  add_min_similarity: 0.45  # extra samples must clearly match the enrolled voice
+  prompts_file: app/enrol/prompts.yaml
+
+bot:
+  asr_model: small
+  language: en            # the assistant is English-only
+  brain: auto             # auto | openai | claude | pollinations | local
+  local_model: mlx-community/Qwen2.5-1.5B-Instruct-4bit
+                          # local MLX model used by `auto` (Apple Silicon)
+  tts: say                # say | print | null
+  tts_voice: null         # e.g. "Samantha"; null = system default
+  barge_in: false         # true = owner can interrupt (no real AEC yet)
+  owner_name: "the owner"
+
+debug:
+  save_utterances: false  # keep owner audio in debug/ only when turned on
+  dir: debug
