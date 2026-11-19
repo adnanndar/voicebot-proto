@@ -26,59 +26,25 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.audio.decode import MIME_EXT, decode_to_wav, guess_ext
 from app.audio.pipeline import AudioPipeline, iter_utterances
 from app.bot.engine import Engine
 from app.config import DATA_DIR, ROOT, load_config
+from app.demo import DemoStore
 from app.enrol.prompts import pick_prompts
 from app.enrol.validate import validate
 from app.enrol.voiceprint import (
     Voiceprint, add_samples, apply_thresholds, enrol, owner_name, parse_spoken_name,
 )
+from app.enrol import words
 from app.gate.gate import SpeakerGate
 
 log = logging.getLogger("voicebot")
 UI_DIR = ROOT / "ui"
 TMP_DIR = ROOT / "tmp"
-
-MIME_EXT = {
-    "audio/webm": ".webm", "video/webm": ".webm",
-    "audio/mp4": ".m4a", "video/mp4": ".m4a", "audio/mp4a-latm": ".m4a",
-    "audio/aac": ".aac", "audio/x-m4a": ".m4a", "audio/mp4a": ".m4a",
-    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
-    "audio/ogg": ".ogg", "application/ogg": ".ogg",
-    "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
-    "audio/flac": ".flac", "audio/x-flac": ".flac",
-    "audio/aiff": ".aiff", "audio/x-aiff": ".aiff", "audio/aifc": ".aiff",
-}
-
-
-def guess_ext(mime: str, name: str) -> str:
-    if mime:
-        m = mime.split(";")[0].strip().lower()
-        if m in MIME_EXT:
-            return MIME_EXT[m]
-    if name and "." in name:
-        return Path(name).suffix.lower()
-    return ".webm"
-
-
-def decode_to_wav(b64: str, mime: str, name: str, workdir: Path) -> Path:
-    """Decode uploaded audio to 16 kHz mono WAV with ffmpeg."""
-    raw = base64.b64decode(b64)
-    src = workdir / f"in{guess_ext(mime, name)}"
-    dst = workdir / "out.wav"
-    src.write_bytes(raw)
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0 or not dst.exists():
-        raise ValueError(f"could not decode audio: {(r.stderr or '').strip()[:300]}")
-    return dst
 
 
 def list_input_devices() -> list[dict]:
@@ -519,25 +485,8 @@ class Runtime:
             "owner_name": name, "prompt": prompt,
         }
 
-    _CONTRACTIONS = {
-        "what's": "what is", "whats": "what is", "i'm": "i am", "im": "i am",
-        "it's": "it is", "that's": "that is", "thats": "that is",
-        "don't": "do not", "dont": "do not", "can't": "cannot", "cant": "cannot",
-        "won't": "will not", "wont": "will not", "let's": "let us",
-        "lets": "let us", "i'll": "i will", "ill": "i will", "we're": "we are",
-        "you're": "you are", "they're": "they are", "there's": "there is",
-        "o'clock": "oclock", "oclock": "oclock",
-    }
-    _TOKEN_RE = re.compile(r"[^a-z0-9'\s]+")
-
     def _tokens(self, text: str) -> list[str]:
-        s = self._TOKEN_RE.sub(" ", text.lower().replace("\u2019", "'"))
-        out: list[str] = []
-        for word in s.split():
-            word = word.replace("'", "")
-            mapped = self._CONTRACTIONS.get(word)
-            out.extend((mapped or word).split())
-        return out
+        return words.tokens(text)
 
     def _word_match(self, audio: np.ndarray) -> tuple[list[dict], str]:
         """Mark each prompt word green (heard) or red (not heard)."""
@@ -550,12 +499,7 @@ class Runtime:
             log.exception("enrolment transcription failed")
             return [], ""
 
-        spoken = set(self._tokens(transcript))
-        words = []
-        for w in prompt.split():
-            need = self._tokens(w)
-            words.append({"word": w, "ok": bool(need) and all(t in spoken for t in need)})
-        return words, transcript
+        return words.mark_words(prompt, transcript), transcript
 
     def _enrol_finish(self) -> dict:
         recs = self.enrol["recordings"]
@@ -658,6 +602,9 @@ class Runtime:
 
 
 RUNTIME = Runtime()
+# Public web demo (browser microphone, per-visitor sessions). Separate from the
+# owner runtime above: it never reads or writes the owner's voiceprint.
+DEMO = DemoStore(RUNTIME.cfg)
 
 
 # ------------------------------------------------------------------------ hub
@@ -699,21 +646,61 @@ HUB = Hub()
 async def lifespan(app: FastAPI):
     TMP_DIR.mkdir(exist_ok=True)
     task = asyncio.create_task(HUB.broadcast_loop())
+    sweep = asyncio.create_task(_demo_sweeper())
+    # load the demo's speech model in the background so the first visitor
+    # does not wait for it
+    threading.Thread(target=DEMO.warm, daemon=True).start()
     yield
     task.cancel()
+    sweep.cancel()
     RUNTIME.stop_listening()
+
+
+async def _demo_sweeper() -> None:
+    """Expire demo sessions and close idle conversations."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            DEMO.timeout_sweep()
+            DEMO.ttl_sweep()
+        except Exception:
+            log.exception("demo sweep failed")
 
 
 app = FastAPI(title="Lyra", lifespan=lifespan)
 
+# Paths a visitor may reach through the public tunnel. Everything else — the
+# owner UI, its API, the WebSocket and the live microphone — stays local.
+_PUBLIC_FILES = {
+    "/demo", "/demo.html", "/demo.js", "/demo.css",
+    "/style.css", "/favicon.ico", "/favicon.svg",
+}
+
+
+def _is_public_request(request) -> bool:
+    h = request.headers
+    return bool(h.get("cf-connecting-ip") or h.get("cf-ray") or h.get("x-forwarded-for"))
+
 
 @app.middleware("http")
-async def no_stale_ui(request, call_next):
-    """Never let a browser keep an old copy of the UI after an update."""
+async def ui_guard(request, call_next):
+    """Serve only the demo to tunneled visitors; never cache UI files."""
+    path = request.url.path
+    public = _is_public_request(request)
+    if public:
+        if path == "/":
+            return RedirectResponse("/demo", status_code=307)
+        if path not in _PUBLIC_FILES and not path.startswith("/api/demo"):
+            return JSONResponse(
+                {"ok": False, "reason": "not available on the public demo"},
+                status_code=403,
+            )
     response = await call_next(request)
-    if not request.url.path.startswith(("/api", "/ws")):
+    if not path.startswith(("/api", "/ws")):
         response.headers["Cache-Control"] = "no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
+    if public:
+        response.headers["X-Robots-Tag"] = "noindex"
     return response
 
 
@@ -829,6 +816,51 @@ def api_profile_restore():
 def api_profile_delete():
     RUNTIME.delete_voiceprint()
     return RUNTIME.snapshot()
+
+
+# ------------------------------------------------------------------ web demo
+@app.get("/demo")
+def demo_page():
+    return FileResponse(UI_DIR / "demo.html")
+
+
+@app.get("/api/demo/session")
+def api_demo_session(sid: str | None = None):
+    return DEMO.get(sid).state()
+
+
+@app.post("/api/demo/start")
+def api_demo_start(payload: dict):
+    session = DEMO.reset(payload.get("sid"))
+    question = "What is your name?"
+    return {
+        "ok": True, "question": question, "audio": DEMO.speak(question),
+        **session.state(),
+    }
+
+
+@app.post("/api/demo/enrol")
+def api_demo_enrol(payload: dict):
+    session = DEMO.get(payload.get("sid"))
+    try:
+        return DEMO.enrol(session, payload.get("audio", ""), payload.get("mime", ""))
+    except ValueError as e:
+        return {"ok": False, "reason": str(e), **session.state()}
+    except Exception as e:
+        log.exception("demo enrolment failed")
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+@app.post("/api/demo/ask")
+def api_demo_ask(payload: dict):
+    session = DEMO.get(payload.get("sid"))
+    try:
+        return DEMO.ask(session, payload.get("audio", ""), payload.get("mime", ""))
+    except ValueError as e:
+        return {"ok": False, "reason": str(e), **session.state()}
+    except Exception as e:
+        log.exception("demo question failed")
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
 
 
 # static UI last, so /api and /ws take precedence

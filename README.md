@@ -509,3 +509,36 @@ The **capture panel** shows the elapsed time and the 2-second silence countdown.
   never saved.
 - Background noise is reduced spectrally, and an adaptive noise gate ignores anything close
   to the ambient noise floor, so a fan or TV hiss does not open an utterance.
+
+---
+
+## 14. Public web demo (share a link)
+
+`/demo` is a **separate, public** experience for people who are not the owner. They use
+their **own browser microphone**, enrol their own voice in three short lines, and then talk
+to Lyra. It shares the same models as the app but keeps everything else apart:
+
+- sessions live **in memory only** — no audio, text or voiceprint is written to disk;
+- the real owner voiceprint in `data/` is never read or changed;
+- each visitor gets their own 35% owner rule against their own three samples;
+- 3 prompts, 15 questions per minute, 30-second clips, 2-hour idle expiry, 200 sessions max;
+- replies come back as WAV audio the browser plays.
+
+Run it exactly like the app, then expose only the demo:
+
+```bash
+python server.py --port 8765
+# in another terminal
+cloudflared tunnel --url http://127.0.0.1:8765 --no-autoupdate
+```
+
+Open the printed `https://….trycloudflare.com` link; `/` redirects to `/demo`. On this Mac,
+plain `http://127.0.0.1:8765` keeps the full owner UI.
+
+**What the tunnel can reach.** Requests that arrive through the tunnel (carrying
+`cf-connecting-ip`, `cf-ray` or `x-forwarded-for`) are limited to `/demo`, its assets and
+`/api/demo/*`. Everything else — the owner UI, `/api/state`, enrolment, `/ws` and the live
+microphone — returns `403`. Local traffic keeps full access.
+
+The backend still runs on this Mac, so the machine must stay awake while the link is shared.
+A quick tunnel has no uptime guarantee and the URL changes each time `cloudflared` starts.

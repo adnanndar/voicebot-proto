@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lyra — live voice demo</title>
+  <meta name="description" content="Talk to Lyra, an owner-only voice assistant. Enrol your voice with three short lines, then say “Hey Lyra”." />
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/demo.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🎙 Lyra</div>
+    <div class="top-right">
+      <span class="pill" id="demo-pill">live demo</span>
+      <span class="status-pill" id="status">ready</span>
+      <span class="dot on" id="conn-dot" title="connected"></span>
+    </div>
+  </header>
+
+  <main class="layout demo-layout">
+    <div class="col-main">
+      <section class="hero">
+        <div class="orb" id="orb">
+          <span class="orb-ring"></span>
+          <span class="orb-ring delay"></span>
+          <div class="orb-core" id="orb-core">🎙</div>
+        </div>
+        <h1 id="hero-title">Talk to Lyra</h1>
+        <p class="sub" id="hero-sub">
+          A private voice assistant that only answers the person it is enrolled to.
+          Your voice never leaves this session.
+        </p>
+
+        <div class="hero-status" id="rec-status">
+          <span class="speech-dot" id="speech-dot"></span>
+          <span id="rec-text">microphone off</span>
+          <div class="meter"><div class="meter-fill" id="level"></div></div>
+          <span class="mic-db" id="rec-time">0.0 s</span>
+        </div>
+        <div class="verify-note" id="verify-note" hidden></div>
+      </section>
+
+      <section class="steps">
+        <div class="step" data-step="1"><span class="num">1</span>
+          <div><b>Say your name</b><small>so Lyra can greet you</small></div></div>
+        <div class="step" data-step="2"><span class="num">2</span>
+          <div><b>Read 3 lines</b><small>builds your voice print</small></div></div>
+        <div class="step" data-step="3"><span class="num">3</span>
+          <div><b>Say “Hey Lyra”</b><small>then ask anything</small></div></div>
+      </section>
+
+      <section class="card" id="enrol-card" hidden>
+        <div class="card-head">
+          <h2>Enrolment</h2>
+          <span class="pill" id="enrol-pill">step 1 of 2</span>
+        </div>
+        <div class="progress"><div class="progress-bar" id="enrol-progress"></div></div>
+
+        <div id="name-stage" hidden>
+          <div class="prompt-count">First question</div>
+          <div class="read-label">Answer out loud:</div>
+          <div class="name-question">🎙 “What is your name?”</div>
+          <div class="hint">Say it naturally, for example “My name is Adnan.”</div>
+        </div>
+
+        <div id="prompt-stage" hidden>
+          <div class="prompt-count" id="prompt-count">Line 1 of 3</div>
+          <div class="read-label">Read this aloud:</div>
+          <div class="prompt-line" id="prompt-line"></div>
+          <div class="hint">Green words were heard; red ones were missed. A red word does not
+            reject the take.</div>
+        </div>
+
+        <div class="rec-row">
+          <button class="btn rec" id="btn-enrol-mic">● Tap to answer</button>
+          <div class="meter grow"><div class="meter-fill" id="enrol-level"></div></div>
+          <span class="rec-time" id="enrol-time"></span>
+        </div>
+        <div class="result" id="enrol-result"></div>
+      </section>
+
+      <section class="card" id="chat-card" hidden>
+        <div class="card-head">
+          <h2>Conversation</h2>
+          <div class="chat-tools">
+            <span class="pill ok" id="chat-pill">enrolled</span>
+            <button class="btn ghost small" id="btn-restart">start over</button>
+          </div>
+        </div>
+        <div class="conversation" id="conversation">
+          <div class="empty">Tap the microphone, then say <b>“Hey Lyra, …”</b></div>
+        </div>
+        <div class="talk-row">
+          <button class="btn big primary talk" id="btn-talk">🎤 Tap to speak</button>
+          <span class="score-note" id="score-note"></span>
+        </div>
+        <div class="hint talk-hint" id="talk-hint">
+          Start with “Hey Lyra”. After she greets you, follow-up questions work
+          without the wake word until you say “stop”.
+        </div>
+      </section>
+
+      <p class="footnote">
+        Demo note: audio is processed for your session only, never stored, and the
+        session is forgotten when you close the tab or after two hours idle.
+      </p>
+    </div>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/demo.js"></script>
+</body>
+</html>

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import threading
+from pathlib import Path
 
 from ..config import AttrDict
 
@@ -85,3 +87,33 @@ def make_tts(cfg: AttrDict):
     if kind == "null":
         return NullTTS()
     raise ValueError(f"unknown tts backend: {kind}")
+
+
+def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
+    """Render `text` to a 16 kHz mono WAV and return its bytes.
+
+    Used by the web demo, where the reply is played in the visitor's browser
+    instead of on this machine's speakers. Returns None when speech synthesis
+    or ffmpeg is unavailable.
+    """
+    text = (text or "").strip()[:800]
+    if not text:
+        return None
+    voice = cfg.bot.get("tts_voice")
+    with tempfile.TemporaryDirectory(prefix="lyra_tts_") as tmp:
+        aiff = Path(tmp) / "say.aiff"
+        wav = Path(tmp) / "say.wav"
+        cmd = ["say"]
+        if voice:
+            cmd += ["-v", str(voice)]
+        cmd += ["-o", str(aiff), text]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(aiff),
+                 "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
+                check=True, capture_output=True, timeout=timeout,
+            )
+            return wav.read_bytes()
+        except (subprocess.SubprocessError, OSError):
+            return None

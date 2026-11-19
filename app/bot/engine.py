@@ -25,24 +25,51 @@ from .tts import make_tts
 from .. import speaker
 
 
+# Short phrases that end the conversation.
+STOP_PHRASES = {
+    "stop", "stop listening", "please stop", "stop it", "that's all", "thats all",
+    "that is all", "i'm done", "im done", "goodbye", "good bye", "bye", "bye bye",
+    "end conversation", "shut down", "shut up", "never mind", "cancel", "quiet",
+}
+_NORM_RE = re.compile(r"[^a-z' ]+")
+# "Lyra" must start the utterance when a conversation is not already open.
+# A few spellings are accepted because speech-to-text may hear the name
+# slightly differently (Lira, Lyrah, Leera, Lara).
+_WAKE_RE = re.compile(
+    r"^\s*(?:(?:hey|hi|okay|ok)[\s,]+)?"
+    r"(?:lyra|lyrah|lira|lirra|laira|leera|lara)\b[\s,.:;!?\-]*",
+    re.I,
+)
+
+
+def is_stop(text: str) -> bool:
+    """True when the whole utterance is a phrase that ends the conversation."""
+    t = re.sub(r"\s+", " ", _NORM_RE.sub(" ", text.lower())).strip()
+    if t in STOP_PHRASES:
+        return True
+    words = t.split()
+    return 0 < len(words) <= 4 and words[-1] in {"stop", "goodbye", "bye"}
+
+
+def split_wake(text: str) -> tuple[bool, str]:
+    """Return (wake word present at the start, remaining request)."""
+    m = _WAKE_RE.match(text)
+    if not m:
+        return False, text.strip()
+    return True, text[m.end():].strip(" ,.;:!?-")
+
+
+def greeting(name: str, with_offer: bool = True) -> str:
+    """Greet the owner by name; fall back to a neutral greeting."""
+    name = str(name or "").strip()
+    named = name.lower() not in {"", "owner", "the owner"}
+    if named:
+        return f"Hey {name}, how are you? How can I help?" if with_offer else f"Hey {name}!"
+    return "Hey! How can I help?" if with_offer else "Hey!"
+
+
 class Engine:
     STATES = ("idle", "listening", "verifying", "thinking", "speaking", "standby")
-
-    # short phrases that end the conversation
-    STOP_PHRASES = {
-        "stop", "stop listening", "please stop", "stop it", "that's all", "thats all",
-        "that is all", "i'm done", "im done", "goodbye", "good bye", "bye", "bye bye",
-        "end conversation", "shut down", "shut up", "never mind", "cancel", "quiet",
-    }
-    _NORM_RE = re.compile(r"[^a-z' ]+")
-    # "Lyra" must start the utterance when a conversation is not already open.
-    # A few spellings are accepted because speech-to-text may hear the name
-    # slightly differently (Lira, Lyrah, Leera, Lara).
-    _WAKE_RE = re.compile(
-        r"^\s*(?:(?:hey|hi|okay|ok)[\s,]+)?"
-        r"(?:lyra|lyrah|lira|lirra|laira|leera|lara)\b[\s,.:;!?\-]*",
-        re.I,
-    )
 
     def __init__(self, cfg: AttrDict):
         self.cfg = cfg
@@ -146,27 +173,13 @@ class Engine:
         return Utterance(audio=audio, start_s=utt.end_s - dur, end_s=utt.end_s)
 
     def _is_stop(self, text: str) -> bool:
-        t = re.sub(r"\s+", " ", self._NORM_RE.sub(" ", text.lower())).strip()
-        if t in self.STOP_PHRASES:
-            return True
-        words = t.split()
-        return 0 < len(words) <= 4 and words[-1] in {"stop", "goodbye", "bye"}
+        return is_stop(text)
 
     def _split_wake(self, text: str) -> tuple[bool, str]:
-        """Return (wake word present at the start, remaining request)."""
-        m = self._WAKE_RE.match(text)
-        if not m:
-            return False, text.strip()
-        return True, text[m.end():].strip(" ,.;:!?-")
+        return split_wake(text)
 
     def _greeting(self, with_offer: bool = True) -> str:
-        name = str(self.cfg.bot.get("owner_name", "the owner"))
-        named = name.strip().lower() not in {"", "owner", "the owner"}
-        if named:
-            if with_offer:
-                return f"Hey {name}, how are you? How can I help?"
-            return f"Hey {name}!"
-        return "Hey! How can I help?" if with_offer else "Hey!"
+        return greeting(self.cfg.bot.get("owner_name", "the owner"), with_offer)
 
     def handle(self, utt: Utterance) -> Decision:
         """Process one utterance end to end. Synchronous."""
