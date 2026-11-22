@@ -344,6 +344,7 @@ class DemoStore:
     def warm(self) -> None:
         try:
             self._asr_engine()
+            self._brain_engine()  # pre-load the answer model so the first reply is fast
             self._say(NAME_QUESTION)
         except Exception:
             pass

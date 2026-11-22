@@ -2,7 +2,7 @@
 
 // Live (browser-mic) driver for the approved Lyra UI.
 // Same look and same behaviour: click "Start listening" once and Lyra keeps
-// listening, detecting when you stop speaking (2 s of silence) before it
+// listening, detecting when you stop speaking (1 s of silence) before it
 // answers. Audio is captured with MediaRecorder — the SAME path used during
 // enrolment — so the voice check stays consistent.
 
@@ -32,7 +32,7 @@ let noiseFloor = 0.015;
 let lastFrameTime = 0;
 let uttStartMs = 0;
 
-const VAD = { start_ms: 300, end_ms: 2000, max_sec: 30 };
+const VAD = { start_ms: 300, end_ms: 1000, max_sec: 30 };
 
 const STATUS_LABELS = {
   idle: "Idle", listening: "Listening", verifying: "Checking your voice…",
@@ -195,7 +195,7 @@ function applyState(s) {
 
   if (stage === "chat") {
     $("#hero-title").textContent = name ? `Ready when you are, ${name}` : "Ready when you are";
-    $("#hero-sub").textContent = "Press Start listening, then say “Hey Lyra”. I decide 2 seconds after you stop speaking.";
+    $("#hero-sub").textContent = "Press Start listening, then say “Hey Lyra”. I decide 1 second after you stop speaking.";
     $("#btn-listen").textContent = listening ? "⏹ Stop" : "▶ Start listening";
   } else if (stage === "name") {
     $("#hero-title").textContent = "Welcome!";
