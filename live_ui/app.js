@@ -67,6 +67,24 @@ function toast(msg, bad) {
     setTimeout(() => { el.hidden = true; }, 300);
   }, 4200);
 }
+
+// Ask the server for the reply audio in the original system voice.
+async function fetchSpeech(text) {
+  const clean = String(text || "").trim();
+  if (!clean) return null;
+  try {
+    const r = await fetch("/api/demo/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: clean }),
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.audio || null;
+  } catch (_) {
+    return null;
+  }
+}
 function setStatus(key, cls) {
   const el = $("#status");
   el.textContent = STATUS_LABELS[key] || key;
@@ -133,6 +151,31 @@ function speakReply(text, onDone) {
   guard = setTimeout(() => { if (!started) finish(); }, 1200);
   try { speechSynthesis.speak(u); } catch (_) { finish(); }
 }
+
+// Play a reply in the original system voice (fetched from the server). Falls
+// back to the browser voice if the server can't synthesise it.
+let speechToken = 0;
+function playServerVoice(text, onDone) {
+  const token = ++speechToken;
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    onDone();
+  };
+  fetchSpeech(text).then((b64) => {
+    if (token !== speechToken || !listening) return;  // superseded/stopped
+    if (b64) {
+      const a = new Audio("data:audio/wav;base64," + b64);
+      a.onended = finish;
+      a.onerror = finish;
+      a.play().catch(() => speakReply(text, finish));
+    } else {
+      speakReply(text, finish);
+    }
+  });
+}
+
 function levelPct(rms) {
   const db = 20 * Math.log10(rms + 1e-9);
   return Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
@@ -534,7 +577,7 @@ function handleAskResult(res) {
   if (res.stop) {
     toast("Conversation closed. Say “Hey Lyra” to start again.");
     setStatus("speaking", "speaking");
-    speakReply(res.reply, () => {
+    playServerVoice(res.reply, () => {
       processing = false;
       if (listening) { startConvRec(); setStatus("standby"); }
     });
@@ -553,7 +596,7 @@ function handleAskResult(res) {
       a.onerror = done;
       a.play().catch(done);
     } else {
-      speakReply(res.reply, done);
+      playServerVoice(res.reply, done);
     }
   }
 }
@@ -600,6 +643,7 @@ function stopListening() {
   listening = false;
   processing = false;
   vadState = "idle";
+  speechToken++;  // cancel any pending server-voice fetch
   $("#capture").hidden = true;
   stopConvRec();
   if ("speechSynthesis" in window) { try { speechSynthesis.cancel(); } catch (_) {} }

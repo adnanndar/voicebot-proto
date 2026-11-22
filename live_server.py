@@ -374,6 +374,7 @@ class DemoStore:
                 trim_to_speech(np.zeros(16000, dtype=np.float32), 16000)
             except Exception:
                 pass
+            self._say(NAME_QUESTION)  # cache the first question in the system voice
         except Exception:
             pass
 
@@ -415,6 +416,7 @@ class DemoStore:
                 return {
                     "ok": True, "stage": "prompts", "name": name,
                     "transcript": text, "prompt": prompt,
+                    "prompt_audio": self._say(prompt),
                     **session.state(),
                 }
 
@@ -438,13 +440,16 @@ class DemoStore:
                 return {
                     "ok": True, "done": True, "stage": "chat", "name": session.name,
                     "transcript": transcript, "words": words,
+                    "prompt_audio": self._say(
+                        f"Nice to meet you, {session.name}. Ask me anything."
+                    ),
                     **session.state(),
                 }
 
             prompt = session.current_prompt
             return {
                 "ok": True, "stage": "prompts", "transcript": transcript,
-                "words": words, "prompt": prompt,
+                "words": words, "prompt": prompt, "prompt_audio": self._say(prompt),
                 **session.state(),
             }
 
@@ -611,7 +616,25 @@ def api_session(sid: str | None = None):
 def api_start(payload: dict):
     session = STORE.reset(payload.get("sid"))
     question = NAME_QUESTION
-    return {"ok": True, "question": question, **session.state()}
+    return {"ok": True, "question": question, "audio": STORE.speak(question), **session.state()}
+
+
+@app.post("/api/demo/tts")
+def api_tts(payload: dict):
+    """Synthesise a reply with the system voice (the original Lyra voice).
+
+    The conversation reply itself is returned as text first (fast), then the
+    browser asks for the audio here, so the "checking your voice" wait stays
+    short while the spoken voice matches the approved app.
+    """
+    text = str(payload.get("text") or "").strip()[:800]
+    if not text:
+        return {"ok": False, "reason": "no text"}
+    try:
+        return {"ok": True, "audio": STORE.speak(text)}
+    except Exception as e:
+        log.exception("tts failed")
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
 
 
 @app.post("/api/demo/enrol")
