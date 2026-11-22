@@ -28,7 +28,7 @@ DEFAULTS = {
     "vad": {
         "threshold": 0.5,
         "start_ms": 300,            # speech needed to open an utterance
-        "end_ms": 1000,             # decide once the speaker has been silent for 1 s
+        "end_ms": 2000,             # decide once the speaker has been silent for 2 s
         "max_sec": 30.0,            # backstop: close even if the room never goes quiet
         "pre_roll_ms": 600,         # keep before speech start so first words survive
         "noise_gate_ratio": 2.0,     # ignore anything within 2x the background noise floor

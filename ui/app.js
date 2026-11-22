@@ -74,11 +74,11 @@ function render(s) {
         : "Say “Hey Lyra” to start.";
     } else {
       $("#hero-title").textContent = "Listening…";
-      $("#hero-sub").textContent = "Speak naturally. I decide 1 second after you stop talking.";
+      $("#hero-sub").textContent = "Speak naturally. I decide 2 seconds after you stop talking.";
     }
   } else if (s.voiceprint.enrolled) {
     $("#hero-title").textContent = ownerName ? `Ready when you are, ${ownerName}` : "Ready when you are";
-    $("#hero-sub").textContent = "Press Start listening, then say “Hey Lyra”. I decide 1 second after you stop.";
+    $("#hero-sub").textContent = "Press Start listening, then say “Hey Lyra”. I decide 2 seconds after you stop.";
   } else {
     $("#hero-title").textContent = "Welcome!";
     $("#hero-sub").textContent = "Step 1: enrol your voice — your name first, then 10 spoken lines.";

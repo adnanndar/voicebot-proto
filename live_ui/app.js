@@ -25,7 +25,7 @@ let listening = false;
 let processing = false;
 let miccheckMode = false;
 let convStream = null, convAudioCtx = null, convScriptNode = null, convMute = null;
-let convRec = null, convChunks = [];
+let convRec = null, convChunks = [], convRecStart = 0;
 let vadState = "idle";          // idle | speech
 let speechMs = 0, quietMs = 0;
 let noiseFloor = 0.015;
@@ -97,6 +97,41 @@ function playClip(b64, text) {
     try { speechSynthesis.speak(new SpeechSynthesisUtterance(text)); } catch (_) {}
   }
   return null;
+}
+
+// Speak a reply in the browser (instant) and call onDone when it finishes.
+// Doing this in the browser keeps the wait after you stop talking near 1 s —
+// the server no longer has to synthesise audio before it can answer.
+function speakReply(text, onDone) {
+  let finished = false;
+  let guard = null;
+  let started = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    if (guard) clearTimeout(guard);
+    onDone();
+  };
+  const clean = String(text || "").trim();
+  if (!clean || !("speechSynthesis" in window)) {
+    setTimeout(finish, 30);
+    return;
+  }
+  try { speechSynthesis.cancel(); } catch (_) {}
+  const u = new SpeechSynthesisUtterance(clean);
+  u.lang = "en-US";
+  u.rate = 1.0;
+  u.onstart = () => {
+    started = true;
+    // Now that speech has begun, allow enough time for the whole sentence.
+    if (guard) clearTimeout(guard);
+    guard = setTimeout(finish, Math.min(30000, 3000 + clean.length * 110));
+  };
+  u.onend = finish;
+  u.onerror = finish;
+  // If the engine never starts (blocked, muted or no voice), don't hang.
+  guard = setTimeout(() => { if (!started) finish(); }, 1200);
+  try { speechSynthesis.speak(u); } catch (_) { finish(); }
 }
 function levelPct(rms) {
   const db = 20 * Math.log10(rms + 1e-9);
@@ -334,12 +369,27 @@ function startConvRec() {
   const mime = pickMime();
   try {
     convRec = new MediaRecorder(convStream, mime ? { mimeType: mime } : undefined);
+    convChunks = [];
+    convRec.ondataavailable = (e) => { if (e.data && e.data.size) convChunks.push(e.data); };
+    convRec.start();
+    convRecStart = performance.now();
   } catch (e) {
-    convRec = new MediaRecorder(convStream);
+    convRec = null;
+    convChunks = [];
+    convRecStart = 0;
+    toast("Could not start recording — reload the page and allow the microphone.", true);
+    stopListening();
   }
+}
+
+function stopConvRec() {
+  if (convRec) {
+    try { convRec.ondataavailable = null; } catch (_) {}
+    if (convRec.state !== "inactive") { try { convRec.stop(); } catch (_) {} }
+  }
+  convRec = null;
   convChunks = [];
-  convRec.ondataavailable = (e) => { if (e.data && e.data.size) convChunks.push(e.data); };
-  convRec.start();
+  convRecStart = 0;
 }
 
 function vadStep(rms, dtMs) {
@@ -384,10 +434,20 @@ function processLevel(samples) {
   $("#mic-db").textContent = (20 * Math.log10(rms + 1e-9)).toFixed(0) + " dB";
   $("#speech-dot").className = "speech-dot" + (rms > 0.012 ? " on" : "");
   $("#speech-text").textContent = vadState === "speech" ? "hearing speech" : "listening…";
+  if (vadState === "speech" && uttStartMs) {
+    $("#capture-time").textContent = ((performance.now() - uttStartMs) / 1000).toFixed(1) + " s";
+  }
 
   const now = performance.now();
   const dt = lastFrameTime ? now - lastFrameTime : 0;
   lastFrameTime = now;
+
+  // Recycle the recorder during long silences so its buffer can't grow without
+  // bound (important for long listening sessions).
+  if (!processing && vadState === "idle" && convRecStart && now - convRecStart > 20000) {
+    stopConvRec();
+    startConvRec();
+  }
   if (!processing && dt > 0) vadStep(rms, dt);
 }
 
@@ -407,14 +467,19 @@ async function endUtterance() {
   }
   convRec = null;
   convChunks = [];
+  convRecStart = 0;
 
-  if (blob.size < 800) { setStatus("listening", "listening"); return; }  // too short to matter
+  if (blob.size < 800) {
+    // Too short to be a real utterance — resume listening with a fresh recorder.
+    if (listening) { startConvRec(); setStatus("listening", "listening"); }
+    return;
+  }
 
   processing = true;
   setStatus("verifying", "verifying");
   try {
     const audio = await blobToBase64(blob);
-    const res = await api("/api/demo/ask", { sid, audio, mime });
+    const res = await api("/api/demo/ask", { sid, audio, mime, miccheck: miccheckMode });
     handleAskResult(res);
   } catch (e) {
     toast(e.message || "something went wrong", true);
@@ -428,12 +493,15 @@ function handleAskResult(res) {
     miccheckMode = false;
     const out = $("#miccheck-out");
     out.hidden = false;
+    const pct = res.score != null ? Math.round(res.score * 100) + "%" : "no match";
+    const transcript = (res.transcript || "").trim();
+    const heard = transcript ? `You said: “${transcript}”` : "Didn't make out the words.";
     if (res.owner === false) {
       out.className = "miccheck-out bad";
-      out.innerHTML = `<b>Not your voice</b> — ${res.score != null ? Math.round(res.score * 100) + "% match" : "no match"}.`;
+      out.innerHTML = `<b>Not your voice</b> — ${pct}.<br>${heard}`;
     } else {
       out.className = "miccheck-out ok";
-      out.innerHTML = `<b>It's you</b> — ${Math.round(res.score * 100)}% match.`;
+      out.innerHTML = `<b>It's you</b> — ${pct}.<br>${heard}`;
     }
     stopListening();
     return;
@@ -465,19 +533,27 @@ function handleAskResult(res) {
   showScore(res.score, true);
   if (res.stop) {
     toast("Conversation closed. Say “Hey Lyra” to start again.");
-    processing = false;
-    startConvRec();
-    setStatus("standby");
+    setStatus("speaking", "speaking");
+    speakReply(res.reply, () => {
+      processing = false;
+      if (listening) { startConvRec(); setStatus("standby"); }
+    });
   } else {
     setStatus("speaking", "speaking");
-    const done = () => { processing = false; startConvRec(); setStatus("listening", "listening"); };
+    let resumed = false;
+    const done = () => {
+      if (resumed) return;
+      resumed = true;
+      processing = false;
+      if (listening) { startConvRec(); setStatus("listening", "listening"); }
+    };
     if (res.audio) {
       const a = new Audio("data:audio/wav;base64," + res.audio);
       a.onended = done;
+      a.onerror = done;
       a.play().catch(done);
     } else {
-      playClip(null, res.reply);
-      done();
+      speakReply(res.reply, done);
     }
   }
 }
@@ -514,6 +590,7 @@ async function startListening(miccheck) {
   speechMs = 0; quietMs = 0;
   lastFrameTime = 0;
   startConvRec();
+  if (!convRec) return;  // recording failed — startConvRec already reset the UI
   setStatus("listening", "listening");
   $("#speech-text").textContent = "listening…";
   $("#btn-listen").textContent = "⏹ Stop";
@@ -524,8 +601,8 @@ function stopListening() {
   processing = false;
   vadState = "idle";
   $("#capture").hidden = true;
-  if (convRec && convRec.state !== "inactive") { try { convRec.stop(); } catch (_) {} }
-  convRec = null; convChunks = [];
+  stopConvRec();
+  if ("speechSynthesis" in window) { try { speechSynthesis.cancel(); } catch (_) {} }
   if (convScriptNode) { try { convScriptNode.disconnect(); } catch (_) {} convScriptNode = null; }
   if (convStream) { try { convStream.getTracks().forEach((t) => t.stop()); } catch (_) {} convStream = null; }
   if (convAudioCtx) { try { convAudioCtx.close().catch(() => {}); } catch (_) {} convAudioCtx = null; }
@@ -571,8 +648,7 @@ $("#btn-miccheck").addEventListener("click", () => {
   if (listening && miccheckMode) { stopListening(); return; }
   out.hidden = false;
   out.className = "miccheck-out";
-  out.textContent = "🎤 Listening — say a full sentence now…";
-  if (listening) stopListening();
+  out.textContent = "🎤 Listening — say a full sentence now…";  if (listening) stopListening();
   startListening(true);
 });
 
@@ -601,6 +677,16 @@ $("#btn-delete").addEventListener("click", async () => {
 
 // --------------------------------------------------------------------- boot
 (async function boot() {
+  // The shared (approved) HTML says "2 seconds"; the live detector uses 1 s.
+  const note = $("#capture-note");
+  if (note) note.textContent = "The bot decides 1 second after you stop talking.";
+  // Warm the browser's speech voices so the first reply is spoken instantly.
+  if ("speechSynthesis" in window) {
+    try {
+      speechSynthesis.getVoices();
+      speechSynthesis.onvoiceschanged = () => { try { speechSynthesis.getVoices(); } catch (_) {} };
+    } catch (_) {}
+  }
   try {
     const url = "/api/demo/session" + (sid ? "?sid=" + encodeURIComponent(sid) : "");
     applyState(await apiGet(url));

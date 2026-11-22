@@ -226,6 +226,28 @@ def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
 
 
 # --------------------------------------------------------------------- session
+class LiveASR(ASR):
+    """ASR that prefers the Apple Metal GPU, falling back to CPU.
+
+    Kept in this file so the owner app's `app/bot/asr.py` stays exactly as it
+    was approved — this only speeds up the live team server.
+    """
+
+    def _get(self):
+        if self._model is not None:
+            return self._model
+        from faster_whisper import WhisperModel
+
+        last_err = None
+        for device in ("mps", "cpu"):
+            try:
+                self._model = WhisperModel(self.model_name, device=device, compute_type="int8")
+                return self._model
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+        raise RuntimeError(f"could not load whisper model: {last_err}")
+
+
 class DemoSession:
     def __init__(self, sid: str, prompts: list[dict]):
         self.id = sid
@@ -271,6 +293,8 @@ class DemoStore:
     def __init__(self, cfg: AttrDict):
         self.cfg = copy.deepcopy(cfg)
         self.cfg.debug.save_utterances = False
+        # Live-only tuning; this copy is never written back to config.yaml.
+        self.cfg.bot.asr_model = "base"  # much faster than "small", still accurate
         self._sessions: dict[str, DemoSession] = {}
         self._lock = threading.Lock()
         self._asr = None
@@ -284,7 +308,7 @@ class DemoStore:
     def _asr_engine(self):
         with self._asr_lock:
             if self._asr is None:
-                self._asr = ASR(self.cfg)
+                self._asr = LiveASR(self.cfg)
             return self._asr
 
     def _brain_engine(self):
@@ -345,7 +369,11 @@ class DemoStore:
         try:
             self._asr_engine()
             self._brain_engine()  # pre-load the answer model so the first reply is fast
-            self._say(NAME_QUESTION)
+            # pre-load the Silero VAD used by trim_to_speech
+            try:
+                trim_to_speech(np.zeros(16000, dtype=np.float32), 16000)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -387,7 +415,6 @@ class DemoStore:
                 return {
                     "ok": True, "stage": "prompts", "name": name,
                     "transcript": text, "prompt": prompt,
-                    "prompt_audio": self._say(prompt),
                     **session.state(),
                 }
 
@@ -411,20 +438,17 @@ class DemoStore:
                 return {
                     "ok": True, "done": True, "stage": "chat", "name": session.name,
                     "transcript": transcript, "words": words,
-                    "prompt_audio": self._say(
-                        f"Nice to meet you, {session.name}. Ask me anything."
-                    ),
                     **session.state(),
                 }
 
             prompt = session.current_prompt
             return {
                 "ok": True, "stage": "prompts", "transcript": transcript,
-                "words": words, "prompt": prompt, "prompt_audio": self._say(prompt),
+                "words": words, "prompt": prompt,
                 **session.state(),
             }
 
-    def ask(self, session: DemoSession, b64: str, mime: str) -> dict:
+    def ask(self, session: DemoSession, b64: str, mime: str, miccheck: bool = False) -> dict:
         if session.stage != "chat" or session.gate is None:
             return {"ok": False, "reason": "finish enrolment first", **session.state()}
 
@@ -449,6 +473,19 @@ class DemoStore:
             decision = session.gate.decide(
                 Utterance(audio=audio, start_s=0.0, end_s=len(audio) / 16000)
             )
+            # Mic check: always transcribe (it is the enrolled user checking
+            # themselves) so the UI can show what was heard, regardless of score.
+            if miccheck:
+                try:
+                    text, _ = self._asr_engine().transcribe(audio)
+                except Exception:
+                    text = ""
+                return {
+                    "ok": True, "owner": decision.owner, "score": decision.score,
+                    "decision": decision.decision, "transcript": text, "miccheck": True,
+                    **session.state(),
+                }
+
             if not decision.owner:
                 return {
                     "ok": True, "owner": False, "score": decision.score,
@@ -460,8 +497,10 @@ class DemoStore:
             if not text.strip():
                 return {
                     "ok": True, "owner": True, "transcript": "",
+                    # No server-side TTS here: the browser speaks the reply
+                    # instantly (Web Speech API), so the wait after you stop
+                    # talking stays close to one second.
                     "reply": "I heard you, but I couldn't make out the words.",
-                    "audio": self._say("I heard you, but I couldn't make out the words."),
                     **session.state(),
                 }
 
@@ -475,8 +514,7 @@ class DemoStore:
                 session.history += [("user", text), ("bot", reply)]
                 return {
                     "ok": True, "owner": True, "transcript": text, "reply": reply,
-                    "stop": True, "score": decision.score,
-                    "audio": self._say(reply), **session.state(),
+                    "stop": True, "score": decision.score, **session.state(),
                 }
 
             if needs_wake and not had_wake:
@@ -509,8 +547,7 @@ class DemoStore:
             session.history = session.history[-20:]
             return {
                 "ok": True, "owner": True, "transcript": text, "reply": reply,
-                "score": decision.score, "wake": needs_wake,
-                "audio": self._say(reply), **session.state(),
+                "score": decision.score, "wake": needs_wake, **session.state(),
             }
 
     def timeout_sweep(self) -> None:
@@ -574,7 +611,7 @@ def api_session(sid: str | None = None):
 def api_start(payload: dict):
     session = STORE.reset(payload.get("sid"))
     question = NAME_QUESTION
-    return {"ok": True, "question": question, "audio": STORE.speak(question), **session.state()}
+    return {"ok": True, "question": question, **session.state()}
 
 
 @app.post("/api/demo/enrol")
@@ -593,7 +630,10 @@ def api_enrol(payload: dict):
 def api_ask(payload: dict):
     session = STORE.get(payload.get("sid"))
     try:
-        return STORE.ask(session, payload.get("audio", ""), payload.get("mime", ""))
+        return STORE.ask(
+            session, payload.get("audio", ""), payload.get("mime", ""),
+            bool(payload.get("miccheck", False)),
+        )
     except ValueError as e:
         return {"ok": False, "reason": str(e), **session.state()}
     except Exception as e:
