@@ -1,0 +1,18 @@
+# Exclude heavy/private local files from the Docker build context.
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+data/
+models/
+tmp/
+debug/
+samples/
+results.json
+eval_scores.csv
+eval_roc.png
+.DS_Store
+.git/
+.gitignore
+Dockerfile
