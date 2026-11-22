@@ -3,7 +3,8 @@
 // Live (browser-mic) driver for the approved Lyra UI.
 // Same look and same behaviour: click "Start listening" once and Lyra keeps
 // listening, detecting when you stop speaking (2 s of silence) before it
-// answers — just like the local owner app, but with the browser microphone.
+// answers. Audio is captured with MediaRecorder — the SAME path used during
+// enrolment — so the voice check stays consistent.
 
 const $ = (s) => document.querySelector(s);
 const SID_KEY = "lyra_live_sid";
@@ -19,21 +20,19 @@ let toastTimer = null;
 let rec = null, recKind = null, recChunks = [], recStart = 0, recTimer = null,
     autoStop = null, busy = false, starting = false;
 
-// ---- continuous conversation capture (VAD) ----
-let listening = false;      // conversation is live
-let processing = false;     // an utterance is being scored/answered
-let miccheckMode = false;   // mic check routes the score elsewhere
-let audioCtx = null, stream = null, scriptNode = null, gainNode = null;
-let sr = 16000;
-let vadState = "idle";      // idle | speech
-let uttChunks = [];         // current utterance PCM
-let idleChunks = [];        // pre-roll buffer
-let idleLen = 0;
+// ---- continuous conversation capture (MediaRecorder + level-based VAD) ----
+let listening = false;
+let processing = false;
+let miccheckMode = false;
+let convStream = null, convAudioCtx = null, convScriptNode = null, convMute = null;
+let convRec = null, convChunks = [];
+let vadState = "idle";          // idle | speech
 let speechMs = 0, quietMs = 0;
-let noiseFloor = 0.01;
-let meterFrame = null;
+let noiseFloor = 0.015;
+let lastFrameTime = 0;
+let uttStartMs = 0;
 
-const VAD = { start_ms: 300, end_ms: 2000, max_sec: 30, pre_roll_ms: 600 };
+const VAD = { start_ms: 300, end_ms: 2000, max_sec: 30 };
 
 const STATUS_LABELS = {
   idle: "Idle", listening: "Listening", verifying: "Checking your voice…",
@@ -72,7 +71,7 @@ function setStatus(key, cls) {
   const el = $("#status");
   el.textContent = STATUS_LABELS[key] || key;
   el.className = "status-pill" + (cls ? " " + cls : "");
-  $("#orb").className = "orb" + (key === "listening" ? " listening" : key === "speaking" ? "" : "");
+  $("#orb").className = "orb" + (key === "listening" ? " listening" : "");
   $("#orb-core").textContent = key === "speaking" ? "🔊" : key === "listening" ? "🎤" : "🎙";
 }
 function saveSid(next) {
@@ -323,112 +322,99 @@ function handleEnrolResult(res) {
   applyState(res);
 }
 
-// ------------------------------------------------ continuous conversation VAD
+// --------------------------------------------- continuous conversation (VAD)
 function rmsOf(samples) {
   let sum = 0;
   for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
   return Math.sqrt(sum / samples.length);
 }
-function concat(chunks) {
-  const n = chunks.reduce((a, c) => a + c.length, 0);
-  const out = new Float32Array(n);
-  let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.length; }
-  return out;
-}
-function float32ToWav(samples, rate) {
-  const n = samples.length;
-  const buf = new ArrayBuffer(44 + n * 2);
-  const dv = new DataView(buf);
-  const ws = (o, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(o + i, str.charCodeAt(i)); };
-  ws(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); ws(8, "WAVE");
-  ws(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
-  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
-  ws(36, "data"); dv.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) {
-    const v = Math.max(-1, Math.min(1, samples[i]));
-    dv.setInt16(44 + i * 2, (v * 32767) | 0, true);
+
+function startConvRec() {
+  if (!convStream || convRec) return;
+  const mime = pickMime();
+  try {
+    convRec = new MediaRecorder(convStream, mime ? { mimeType: mime } : undefined);
+  } catch (e) {
+    convRec = new MediaRecorder(convStream);
   }
-  return new Blob([buf], { type: "audio/wav" });
-}
-function trimIdle() {
-  const max = Math.floor((sr * VAD.pre_roll_ms) / 1000) * 2;
-  while (idleLen > max && idleChunks.length > 1) {
-    idleLen -= idleChunks.shift().length;
-  }
-}
-function flushIdle() {
-  const all = concat(idleChunks);
-  const keep = Math.floor((sr * VAD.pre_roll_ms) / 1000);
-  const pre = all.length > keep ? all.subarray(all.length - keep) : all;
-  return pre.length ? [pre] : [];
+  convChunks = [];
+  convRec.ondataavailable = (e) => { if (e.data && e.data.size) convChunks.push(e.data); };
+  convRec.start();
 }
 
-function processAudio(samples) {
-  if (!listening || processing) return;
-  const rms = rmsOf(samples);
-  $("#live-level").style.width = levelPct(rms) + "%";
-  $("#mic-db").textContent = (20 * Math.log10(rms + 1e-9)).toFixed(0) + " dB";
-  $("#speech-dot").className = "speech-dot" + (rms > 0.012 ? " on" : "");
-  $("#speech-text").textContent = vadState === "speech" ? "hearing speech" : "listening…";
-
-  const ms = (samples.length / sr) * 1000;
+function vadStep(rms, dtMs) {
   const thr = Math.max(noiseFloor * 2.5, 0.01);
-
   if (vadState === "idle") {
     noiseFloor = 0.98 * noiseFloor + 0.02 * rms;
-    idleChunks.push(samples);
-    idleLen += samples.length;
-    trimIdle();
     if (rms > thr) {
-      speechMs += ms;
+      speechMs += dtMs;
       if (speechMs >= VAD.start_ms) {
         vadState = "speech";
-        uttChunks = flushIdle();
         speechMs = 0; quietMs = 0;
+        uttStartMs = performance.now();
         $("#capture").hidden = false;
-        $("#capture-title").textContent = "Capturing your speech…";
         $("#capture").classList.remove("quiet");
+        $("#capture-title").textContent = "Capturing your speech…";
         setStatus("listening", "listening");
       }
     } else {
       speechMs = 0;
     }
   } else {
-    uttChunks.push(samples);
     if (rms < thr) {
-      quietMs += ms;
+      quietMs += dtMs;
       const q = Math.min(quietMs, VAD.end_ms);
       $("#capture").classList.add("quiet");
       $("#capture-title").textContent = `Speaker paused — ${(q / 1000).toFixed(1)} of ${(VAD.end_ms / 1000).toFixed(1)} s of silence`;
       $("#capture-fill").style.width = (q / VAD.end_ms) * 100 + "%";
-      if (quietMs >= VAD.end_ms) { closeUtterance(); }
+      if (quietMs >= VAD.end_ms) { endUtterance(); }
     } else {
       quietMs = 0;
       $("#capture").classList.remove("quiet");
       $("#capture-title").textContent = "Capturing your speech…";
     }
-    const uttSec = uttChunks.reduce((a, c) => a + c.length, 0) / sr;
-    if (uttSec >= VAD.max_sec) closeUtterance();
+    if (performance.now() - uttStartMs >= VAD.max_sec * 1000) endUtterance();
   }
 }
 
-function closeUtterance() {
-  vadState = "idle";
-  $("#capture").hidden = true;
-  const audio = concat(uttChunks);
-  uttChunks = []; idleChunks = []; idleLen = 0;
-  speechMs = 0; quietMs = 0;
-  if (audio.length < sr * 0.4) { setStatus("listening", "listening"); return; }  // too short to matter
-  sendUtterance(audio);
+function processLevel(samples) {
+  if (!listening) return;
+  const rms = rmsOf(samples);
+  $("#live-level").style.width = levelPct(rms) + "%";
+  $("#mic-db").textContent = (20 * Math.log10(rms + 1e-9)).toFixed(0) + " dB";
+  $("#speech-dot").className = "speech-dot" + (rms > 0.012 ? " on" : "");
+  $("#speech-text").textContent = vadState === "speech" ? "hearing speech" : "listening…";
+
+  const now = performance.now();
+  const dt = lastFrameTime ? now - lastFrameTime : 0;
+  lastFrameTime = now;
+  if (!processing && dt > 0) vadStep(rms, dt);
 }
 
-async function sendUtterance(audio) {
+async function endUtterance() {
+  if (vadState !== "speech") return;
+  vadState = "idle";
+  $("#capture").hidden = true;
+  speechMs = 0; quietMs = 0;
+
+  const mime = convRec ? (convRec.mimeType || pickMime() || "audio/webm") : "audio/webm";
+  let blob = new Blob(convChunks, { type: mime });
+  if (convRec && convRec.state !== "inactive") {
+    blob = await new Promise((resolve) => {
+      convRec.onstop = () => resolve(new Blob(convChunks, { type: mime }));
+      try { convRec.stop(); } catch (_) { resolve(new Blob(convChunks, { type: mime })); }
+    });
+  }
+  convRec = null;
+  convChunks = [];
+
+  if (blob.size < 800) { setStatus("listening", "listening"); return; }  // too short to matter
+
   processing = true;
   setStatus("verifying", "verifying");
-  const b64 = await blobToBase64(float32ToWav(audio, sr));
   try {
-    const res = await api("/api/demo/ask", { sid, audio: b64, mime: "audio/wav" });
+    const audio = await blobToBase64(blob);
+    const res = await api("/api/demo/ask", { sid, audio, mime });
     handleAskResult(res);
   } catch (e) {
     toast(e.message || "something went wrong", true);
@@ -461,6 +447,7 @@ function handleAskResult(res) {
       ? `Paused — ${res.reason || "too many unknown attempts"}.`
       : `That didn't sound like the enrolled voice (${pct}).`, true);
     processing = false;
+    startConvRec();
     setStatus("listening", "listening");
     return;
   }
@@ -469,6 +456,7 @@ function handleAskResult(res) {
     showScore(res.score, true);
     toast(res.reply || "Say “Hey Lyra” to start.");
     processing = false;
+    startConvRec();
     setStatus("listening", "listening");
     return;
   }
@@ -478,10 +466,11 @@ function handleAskResult(res) {
   if (res.stop) {
     toast("Conversation closed. Say “Hey Lyra” to start again.");
     processing = false;
+    startConvRec();
     setStatus("standby");
   } else {
     setStatus("speaking", "speaking");
-    const done = () => { processing = false; setStatus("listening", "listening"); };
+    const done = () => { processing = false; startConvRec(); setStatus("listening", "listening"); };
     if (res.audio) {
       const a = new Audio("data:audio/wav;base64," + res.audio);
       a.onended = done;
@@ -500,28 +489,31 @@ async function startListening(miccheck) {
     return;
   }
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    convStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (e) {
     toast("Microphone blocked — allow mic access and try again.", true);
     return;
   }
-  try { audioCtx = new AudioContext({ sampleRate: 16000 }); } catch (e) { audioCtx = new AudioContext(); }
-  sr = audioCtx.sampleRate;
-  const source = audioCtx.createMediaStreamSource(stream);
-  scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
-  scriptNode.onaudioprocess = (e) => processAudio(e.inputBuffer.getChannelData(0));
-  gainNode = audioCtx.createGain();
-  gainNode.gain.value = 0;
-  source.connect(scriptNode);
-  scriptNode.connect(gainNode);
-  gainNode.connect(audioCtx.destination);
+  try {
+    convAudioCtx = new AudioContext({ sampleRate: 16000 });
+    if (convAudioCtx.state === "suspended") convAudioCtx.resume().catch(() => {});
+    const src = convAudioCtx.createMediaStreamSource(convStream);
+    convScriptNode = convAudioCtx.createScriptProcessor(2048, 1, 1);
+    convScriptNode.onaudioprocess = (e) => processLevel(e.inputBuffer.getChannelData(0));
+    convMute = convAudioCtx.createGain();
+    convMute.gain.value = 0;
+    src.connect(convScriptNode);
+    convScriptNode.connect(convMute);
+    convMute.connect(convAudioCtx.destination);
+  } catch (_) {}
 
   listening = true;
   processing = false;
   miccheckMode = !!miccheck;
   vadState = "idle";
-  uttChunks = []; idleChunks = []; idleLen = 0;
   speechMs = 0; quietMs = 0;
+  lastFrameTime = 0;
+  startConvRec();
   setStatus("listening", "listening");
   $("#speech-text").textContent = "listening…";
   $("#btn-listen").textContent = "⏹ Stop";
@@ -532,10 +524,12 @@ function stopListening() {
   processing = false;
   vadState = "idle";
   $("#capture").hidden = true;
-  if (scriptNode) { try { scriptNode.disconnect(); } catch (_) {} scriptNode = null; }
-  if (stream) { try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {} stream = null; }
-  if (audioCtx) { try { audioCtx.close().catch(() => {}); } catch (_) {} audioCtx = null; }
-  gainNode = null;
+  if (convRec && convRec.state !== "inactive") { try { convRec.stop(); } catch (_) {} }
+  convRec = null; convChunks = [];
+  if (convScriptNode) { try { convScriptNode.disconnect(); } catch (_) {} convScriptNode = null; }
+  if (convStream) { try { convStream.getTracks().forEach((t) => t.stop()); } catch (_) {} convStream = null; }
+  if (convAudioCtx) { try { convAudioCtx.close().catch(() => {}); } catch (_) {} convAudioCtx = null; }
+  convMute = null;
   setStatus("idle");
   $("#speech-dot").className = "speech-dot";
   $("#speech-text").textContent = "microphone off";
