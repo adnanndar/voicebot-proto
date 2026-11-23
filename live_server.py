@@ -680,12 +680,17 @@ def app_js():
 
 
 def main() -> None:
+    import os
+
     import uvicorn
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("PORT", "8766"))
+    )
     args = parser.parse_args()
-    uvicorn.run(app, host="127.0.0.1", port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
