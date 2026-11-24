@@ -21,7 +21,10 @@ import argparse
 import base64
 import copy
 import logging
+import os
 import re
+import select
+import struct
 import subprocess
 import sys
 import tempfile
@@ -199,6 +202,102 @@ def prep_enrol_audio(audio: np.ndarray) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------ TTS
+class WarmVoiceEngine:
+    """Keeps the macOS speech engine loaded in a small worker process.
+
+    Launching `say` per reply costs about a second of engine start-up every
+    time, which made the spoken answer trail the text. The worker uses
+    NSSpeechSynthesizer — the same engine and default voice as `say` — and
+    answers length-prefixed requests over stdin/stdout. If it cannot start we
+    fall back to the old one-shot `say` path in `speech_wav`.
+    """
+
+    def __init__(self, voice: str | None = None):
+        self._voice = (voice or "").strip()
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+
+    def _start(self) -> None:
+        cmd = [sys.executable, str(ROOT / "live_tts.py")]
+        if self._voice:
+            cmd += ["--voice", self._voice]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _stop(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    def _read_exact(self, n: int, deadline: float) -> bytes | None:
+        assert self._proc is not None and self._proc.stdout is not None
+        fd = self._proc.stdout.fileno()
+        buf = b""
+        while len(buf) < n:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("speech worker timed out")
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise TimeoutError("speech worker timed out")
+            chunk = os.read(fd, n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _request(self, text: str) -> bytes | None:
+        if self._proc is None or self._proc.poll() is not None:
+            self._start()
+        assert self._proc is not None and self._proc.stdin is not None
+        deadline = time.monotonic() + 45.0
+        raw = text.encode("utf-8")
+        self._proc.stdin.write(struct.pack(">I", len(raw)) + raw)
+        self._proc.stdin.flush()
+        head = self._read_exact(4, deadline)
+        if head is None:
+            raise OSError("speech worker exited")
+        (size,) = struct.unpack(">I", head)
+        audio = self._read_exact(size, deadline) if size else b""
+        if audio is None:
+            raise OSError("speech worker exited")
+        return audio or None
+
+    def speak(self, text: str) -> bytes | None:
+        with self._lock:
+            try:
+                return self._request(text)
+            except Exception:
+                # One respawn in case the worker died (e.g. after a system sleep).
+                self._stop()
+                return self._request(text)
+
+
+_WARM_VOICE: WarmVoiceEngine | None = None
+_WARM_VOICE_LOCK = threading.Lock()
+
+
+def _warm_voice(voice: str | None) -> WarmVoiceEngine:
+    global _WARM_VOICE
+    with _WARM_VOICE_LOCK:
+        if _WARM_VOICE is None:
+            _WARM_VOICE = WarmVoiceEngine(voice)
+        return _WARM_VOICE
+
+
 def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
     text = (text or "").strip()[:800]
     if not text:
@@ -206,8 +305,14 @@ def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
     voice = cfg.bot.get("tts_voice")
     with tempfile.TemporaryDirectory(prefix="lyra_tts_") as tmp:
         wav = Path(tmp) / "out.wav"
-        # macOS: system `say` (identical to the local owner app).
+        # macOS: the system `say` voice, kept warm between replies.
         if sys.platform == "darwin":
+            try:
+                audio = _warm_voice(voice).speak(text)
+                if audio:
+                    return audio
+            except Exception:
+                log.warning("warm speech worker failed; using one-shot say", exc_info=True)
             aiff = Path(tmp) / "say.aiff"
             cmd = ["say"]
             if voice:
