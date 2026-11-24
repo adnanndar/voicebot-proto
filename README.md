@@ -226,16 +226,26 @@ The first start downloads the local model
 `bot.brain: auto` uses the best backend available:
 
 1. **Claude** when `ANTHROPIC_API_KEY` is set (default model `claude-sonnet-5-5`)
-2. **OpenAI** when `OPENAI_API_KEY` is set
+2. **OpenAI** when `OPENAI_API_KEY` is set (default model `gpt-4o-mini`)
 3. **Local MLX model** on this Mac (~1 GB, no network)
 4. Built-in rules: time, date, live weather, arithmetic
 
-Paste your Anthropic key into `.env`:
+Paste your keys into `.env` (both are optional — any combination works):
 
 ```bash
+# OpenAI — https://platform.openai.com/api-keys
+OPENAI_API_KEY=sk-...
+# optional: OPENAI_MODEL=gpt-4o-mini
+# optional: OPENAI_BASE_URL=https://api.openai.com/v1   # any OpenAI-compatible endpoint
+
+# Anthropic — https://console.anthropic.com/
 ANTHROPIC_API_KEY=sk-ant-...
 # optional: ANTHROPIC_MODEL=claude-sonnet-5-5
 ```
+
+When both `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are set, Claude is tried first,
+then OpenAI, then the local model. A failed or exhausted provider backs off for
+90 s and the next one answers, so a missing key never leaves Lyra silent.
 
 When a hosted key is configured, transcripts leave the Mac for that provider.
 With the local model, they never do.
