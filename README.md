@@ -226,17 +226,22 @@ The first start downloads the local model
 `bot.brain: auto` uses the best backend available:
 
 1. **Claude** when `ANTHROPIC_API_KEY` is set (default model `claude-sonnet-5-5`)
-2. **OpenAI** when `OPENAI_API_KEY` is set (default model `gpt-4o-mini`)
+2. **OpenAI-compatible** when `OPENAI_API_KEY` is set (OpenAI, Groq, or any endpoint)
 3. **Local MLX model** on this Mac (~1 GB, no network)
 4. Built-in rules: time, date, live weather, arithmetic
 
-Paste your keys into `.env` (both are optional — any combination works):
+Paste your keys into `.env` (all optional — any combination works):
 
 ```bash
 # OpenAI — https://platform.openai.com/api-keys
 OPENAI_API_KEY=sk-...
 # optional: OPENAI_MODEL=gpt-4o-mini
-# optional: OPENAI_BASE_URL=https://api.openai.com/v1   # any OpenAI-compatible endpoint
+# optional: OPENAI_BASE_URL=https://api.openai.com/v1
+
+# ...or a FREE Groq key — https://console.groq.com/keys (OpenAI-compatible)
+OPENAI_API_KEY=gsk-...
+OPENAI_BASE_URL=https://api.groq.com/openai/v1
+OPENAI_MODEL=openai/gpt-oss-20b        # or openai/gpt-oss-120b
 
 # Anthropic — https://console.anthropic.com/
 ANTHROPIC_API_KEY=sk-ant-...
@@ -244,8 +249,9 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 When both `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are set, Claude is tried first,
-then OpenAI, then the local model. A failed or exhausted provider backs off for
-90 s and the next one answers, so a missing key never leaves Lyra silent.
+then the OpenAI-compatible endpoint, then the local model. A failed or exhausted
+provider backs off for 90 s and the next one answers, so a missing key never
+leaves Lyra silent.
 
 When a hosted key is configured, transcripts leave the Mac for that provider.
 With the local model, they never do.
