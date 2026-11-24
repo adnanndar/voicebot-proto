@@ -16,7 +16,8 @@ let total = 10;
 let lastPrompt = "";
 let toastTimer = null;
 let dragging = false;          // true while the sleep-timer slider is dragged
-let acceptThreshold = 0.35;    // owner rule (fixed 35%, shown on the score bar)
+let draggingThreshold = false; // true while the owner-threshold slider is dragged
+let acceptThreshold = 0.35;    // owner rule (35% default, shown on the score bar)
 
 // ---- enrolment recording (push-to-record, same as the approved flow) ----
 let rec = null, recKind = null, recChunks = [], recStart = 0, recTimer = null,
@@ -244,6 +245,12 @@ function showScore(score, owner) {
   $("#score-thresh").style.left = (Math.max(0, Math.min(1, acceptThreshold)) * 100) + "%";
   $("#score-label").textContent =
     (owner ? "✓ it's you — " : "✗ not you — ") + (score * 100).toFixed(0) + "% match";
+  updateScoreHint();
+}
+
+function updateScoreHint() {
+  const hint = $(".score-hint");
+  if (hint) hint.textContent = `owner = ${Math.round(acceptThreshold * 100)}% or higher`;
 }
 
 function setSlider(id, value) {
@@ -254,6 +261,17 @@ function setSlider(id, value) {
     el.value = String(v);
     const out = $(id + "-out");
     if (out) out.textContent = v;
+  }
+}
+
+function setThreshold(value) {
+  const el = $("#threshold");
+  if (!el) return;
+  const pct = Math.round(Number(value) * 100);
+  if (Math.abs(parseFloat(el.value) - pct) > 0.5) {
+    el.value = String(pct);
+    const out = $("#threshold-out");
+    if (out) out.textContent = pct + "%";
   }
 }
 
@@ -306,7 +324,7 @@ function applyState(s) {
     $("#hero-sub").textContent = "Read each line aloud to finish enrolment.";
   }
 
-  // Settings (same controls as the approved app).
+  // Settings (same controls as the approved app, plus the live threshold).
   const st = s.settings || {};
   if (st.accept_threshold != null) acceptThreshold = Number(st.accept_threshold);
   if (!dragging) {
@@ -315,6 +333,10 @@ function applyState(s) {
     if (te) te.checked = !!st.timeout_enabled;
     const su = $("#saveutt");
     if (su) su.checked = false;
+  }
+  if (!draggingThreshold && st.accept_threshold != null) {
+    setThreshold(st.accept_threshold);
+    updateScoreHint();
   }
 
   renderConversation(s.conversation || []);
@@ -773,6 +795,22 @@ async function saveSettings(patch) {
   }
   const auto = $("#timeout-enabled");
   if (auto) auto.addEventListener("change", () => saveSettings({ timeout_enabled: auto.checked }));
+
+  const th = $("#threshold");
+  const thOut = $("#threshold-out");
+  if (th) {
+    th.addEventListener("input", () => {
+      draggingThreshold = true;
+      acceptThreshold = parseFloat(th.value) / 100;
+      if (thOut) thOut.textContent = th.value + "%";
+      updateScoreHint();
+      $("#score-thresh").style.left = (Math.max(0, Math.min(1, acceptThreshold)) * 100) + "%";
+    });
+    th.addEventListener("change", () => {
+      draggingThreshold = false;
+      saveSettings({ accept_threshold: parseFloat(th.value) / 100 });
+    });
+  }
 
   // Approved controls that do not apply to the shared live app: audio is never
   // written to disk and there is no persistent profile to add samples to.

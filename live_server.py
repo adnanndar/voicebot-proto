@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.bot.asr import ASR
@@ -53,6 +53,19 @@ logging.basicConfig(level=logging.INFO)
 
 UI_DIR = ROOT / "ui"          # the approved UI (index.html + style.css), read-only
 LIVE_UI_DIR = ROOT / "live_ui"  # browser-mic app.js for the live version
+
+# Extra Settings control for the live app. The approved HTML is served
+# byte-for-byte apart from this one injected block, so the owner rule can be
+# tuned here without editing the approved `ui/index.html`.
+THRESHOLD_CONTROL = (
+    '          <label class="field">Owner threshold (%)\n'
+    '            <input type="range" id="threshold" min="20" max="90" step="1" />\n'
+    '            <output id="threshold-out"></output>\n'
+    '          </label>\n'
+)
+ANCHOR_CONTROL = (
+    '          <label class="toggle"><input type="checkbox" id="timeout-enabled" /> auto-sleep when idle</label>\n'
+)
 
 SAMPLE_COUNT = 10
 SESSION_TTL = 2 * 60 * 60
@@ -539,11 +552,21 @@ class DemoStore:
         return self._new()
 
     def update_settings(self, payload: dict) -> None:
-        """Apply the same settings the approved app offers.
-
-        The owner rule stays fixed at 35% (the approved app deliberately does
-        not expose it), so a crafted request cannot weaken the voice check.
-        """
+        """Apply the same settings the approved app offers, plus the live-only
+        owner-threshold slider (kept between 20% and 90% so the voice check
+        can be tuned but never dropped or made impossibly strict)."""
+        if "accept_threshold" in payload:
+            try:
+                t = float(payload["accept_threshold"])
+            except (TypeError, ValueError):
+                t = float(self.cfg.gate.accept_threshold)
+            t = max(0.20, min(0.90, t))
+            self.cfg.gate.accept_threshold = t
+            with self._lock:
+                sessions = list(self._sessions.values())
+            for session in sessions:
+                if session.gate is not None:
+                    session.gate.accept = t
         if "timeout_minutes" in payload:
             try:
                 minutes = float(payload["timeout_minutes"])
@@ -886,17 +909,26 @@ def api_ask(payload: dict):
 
 @app.get("/")
 def index():
-    return FileResponse(UI_DIR / "index.html")
+    html = (UI_DIR / "index.html").read_text()
+    if THRESHOLD_CONTROL not in html:
+        if ANCHOR_CONTROL in html:
+            html = html.replace(ANCHOR_CONTROL, THRESHOLD_CONTROL + ANCHOR_CONTROL)
+        else:
+            html = html.replace(
+                '<div class="settings-grid">',
+                '<div class="settings-grid">\n' + THRESHOLD_CONTROL,
+            )
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/style.css")
 def style():
-    return FileResponse(UI_DIR / "style.css")
+    return FileResponse(UI_DIR / "style.css", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/app.js")
 def app_js():
-    return FileResponse(LIVE_UI_DIR / "app.js")
+    return FileResponse(LIVE_UI_DIR / "app.js", headers={"Cache-Control": "no-store"})
 
 
 def main() -> None:
