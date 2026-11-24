@@ -68,8 +68,9 @@ function toast(msg, bad) {
   }, 4200);
 }
 
-// Ask the server for the reply audio in the original system voice.
-async function fetchSpeech(text) {
+// Ask the server for the reply audio in the original system voice. The server
+// sends MP3 (much smaller than WAV), so the voice starts sooner over the tunnel.
+async function fetchSpeechUrl(text) {
   const clean = String(text || "").trim();
   if (!clean) return null;
   try {
@@ -79,8 +80,9 @@ async function fetchSpeech(text) {
       body: JSON.stringify({ text: clean }),
     });
     if (!r.ok) return null;
-    const data = await r.json();
-    return data.audio || null;
+    const blob = await r.blob();
+    if (!blob.size) return null;
+    return URL.createObjectURL(blob);
   } catch (_) {
     return null;
   }
@@ -158,21 +160,29 @@ let speechToken = 0;
 function playServerVoice(text, onDone) {
   const token = ++speechToken;
   let finished = false;
+  let url = null;
+  const cleanup = () => {
+    if (!url) return;
+    try { URL.revokeObjectURL(url); } catch (_) {}
+    url = null;
+  };
   const finish = () => {
     if (finished) return;
     finished = true;
+    cleanup();
     onDone();
   };
-  fetchSpeech(text).then((b64) => {
-    if (token !== speechToken || !listening) return;  // superseded/stopped
-    if (b64) {
-      const a = new Audio("data:audio/wav;base64," + b64);
-      a.onended = finish;
-      a.onerror = finish;
-      a.play().catch(() => speakReply(text, finish));
-    } else {
+  fetchSpeechUrl(text).then((next) => {
+    url = next;
+    if (token !== speechToken || !listening) { cleanup(); return; }  // superseded/stopped
+    if (!url) {
       speakReply(text, finish);
+      return;
     }
+    const a = new Audio(url);
+    a.onended = finish;
+    a.onerror = finish;
+    a.play().catch(() => { cleanup(); speakReply(text, finish); });
   });
 }
 

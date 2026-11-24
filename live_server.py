@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.bot.asr import ASR
@@ -350,6 +350,21 @@ def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
             return None
 
 
+def wav_to_mp3(wav: bytes) -> bytes | None:
+    """Compress a WAV clip to mono MP3 so the reply travels faster."""
+    if not wav:
+        return None
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", "pipe:0",
+             "-ac", "1", "-ar", "24000", "-b:a", "64k", "-f", "mp3", "pipe:1"],
+            input=wav, capture_output=True, timeout=30,
+        )
+        return r.stdout if r.returncode == 0 and r.stdout else None
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
 # --------------------------------------------------------------------- session
 class LiveASR(ASR):
     """ASR that prefers the Apple Metal GPU, falling back to CPU.
@@ -434,6 +449,7 @@ class DemoStore:
         self._brain_lock = threading.Lock()
         self._work = threading.Semaphore(2)
         self._tts_cache: dict[str, bytes | None] = {}
+        self._tts_mp3_cache: dict[str, bytes | None] = {}
         self._tts_lock = threading.Lock()
 
     def _asr_engine(self):
@@ -458,6 +474,21 @@ class DemoStore:
                 if len(self._tts_cache) < 32:
                     self._tts_cache[key] = audio
         return base64.b64encode(audio).decode() if audio else None
+
+    def speak_mp3(self, text: str) -> bytes | None:
+        """Reply audio as MP3 (~7x smaller than WAV, so it arrives sooner)."""
+        key = text.strip()
+        with self._tts_lock:
+            if key in self._tts_mp3_cache:
+                return self._tts_mp3_cache[key]
+        wav_b64 = self._say(key)
+        if not wav_b64:
+            return None
+        mp3 = wav_to_mp3(base64.b64decode(wav_b64))
+        with self._tts_lock:
+            if len(self._tts_mp3_cache) < 64:
+                self._tts_mp3_cache[key] = mp3
+        return mp3
 
     def _new(self) -> DemoSession:
         prompts = pick_prompts(self.cfg, SAMPLE_COUNT)
@@ -755,14 +786,20 @@ def api_tts(payload: dict):
     """Synthesise a reply with the system voice (the original Lyra voice).
 
     The conversation reply itself is returned as text first (fast), then the
-    browser asks for the audio here, so the "checking your voice" wait stays
-    short while the spoken voice matches the approved app.
+    browser asks for the audio here. Audio is sent as MP3 so it crosses the
+    tunnel quickly; the voice is still the same macOS `say` voice.
     """
     text = str(payload.get("text") or "").strip()[:800]
     if not text:
-        return {"ok": False, "reason": "no text"}
+        return JSONResponse({"ok": False, "reason": "no text"}, status_code=400)
     try:
-        return {"ok": True, "audio": STORE.speak(text)}
+        audio = STORE.speak_mp3(text)
+        if audio:
+            return Response(content=audio, media_type="audio/mpeg")
+        wav_b64 = STORE.speak(text)
+        if wav_b64:
+            return Response(content=base64.b64decode(wav_b64), media_type="audio/wav")
+        return JSONResponse({"ok": False, "reason": "speech unavailable"}, status_code=503)
     except Exception as e:
         log.exception("tts failed")
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
