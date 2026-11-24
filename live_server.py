@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import json
 import logging
 import os
 import re
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -40,7 +42,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.bot.asr import ASR
-from app.bot.brain import make_brain
+from app.bot.brain import (
+    USER_AGENT,
+    OpenAICompatBrain,
+    _build_messages,
+    _clean,
+    _system_for,
+    make_brain,
+)
 from app.config import ROOT, AttrDict, load_config
 from app.enrol.prompts import pick_prompts
 from app.enrol.validate import validate
@@ -452,6 +461,74 @@ class DemoSession:
         }
 
 
+class LiveHostedBrain(OpenAICompatBrain):
+    """OpenAI-compatible backend with headroom for reasoning models.
+
+    The approved brain caps replies at 120 tokens, which is plenty for classic
+    models (gpt-4o-mini, Claude, the local Qwen) but too small for Groq's free
+    reasoning models (GPT-OSS / Qwen): their internal reasoning counts against
+    the same budget, so the answer gets truncated or comes back empty. This
+    live-only subclass raises the cap; `_clean()` still trims the reply to at
+    most four short spoken sentences, so the voice never runs long.
+    """
+
+    MAX_TOKENS = 512
+
+    def __init__(self, url: str, model: str, api_key: str = "",
+                 owner_name: str = "the owner", timeout: float = 20.0):
+        # Unlike the parent, `url` here is already the full /chat/completions
+        # endpoint (copied from the provider make_brain built), so store it as-is.
+        self.url = url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.owner_name = owner_name
+        self.timeout = timeout
+
+    def reply(self, transcript: str, history: list, context: str = "") -> str:
+        system = _system_for(self.owner_name)
+        if context:
+            system += "\n\n" + context
+        payload = {
+            "model": self.model,
+            "messages": _build_messages(transcript, history, system),
+            "max_tokens": self.MAX_TOKENS,
+            "temperature": 0.3,
+        }
+        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            self.url, data=json.dumps(payload).encode("utf-8"), headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+        try:
+            data = json.loads(body)
+            text = data["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            # some keyless endpoints answer with plain text
+            text = body
+        return _clean(text)
+
+
+def _upgrade_hosted_backends(brain) -> None:
+    """Swap Groq-bound backends for LiveHostedBrain (more token headroom).
+
+    Only Groq is upgraded: the keyless Pollinations fallback and a real OpenAI
+    key keep the approved 120-token behaviour. Everything else — provider order,
+    the local model, the built-in rules — is left exactly as make_brain built it.
+    """
+    providers = getattr(brain, "providers", None)
+    if not providers:
+        return
+    for i, provider in enumerate(providers):
+        if isinstance(provider, OpenAICompatBrain) and "groq" in getattr(provider, "url", ""):
+            providers[i] = LiveHostedBrain(
+                provider.url, provider.model, provider.api_key,
+                provider.owner_name, provider.timeout,
+            )
+
+
 class DemoStore:
     def __init__(self, cfg: AttrDict):
         self.cfg = copy.deepcopy(cfg)
@@ -493,6 +570,7 @@ class DemoStore:
         with self._brain_lock:
             if self._brain is None:
                 self._brain = make_brain(self.cfg)
+                _upgrade_hosted_backends(self._brain)
             return self._brain
 
     def _say(self, text: str) -> str | None:
