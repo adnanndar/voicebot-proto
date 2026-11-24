@@ -866,6 +866,14 @@ class DemoStore:
 
 # ----------------------------------------------------------------------- server
 cfg = load_config()
+# Cloud hosts inject configuration as environment variables, not a `.env` file.
+# load_config() only reads the `.env` file, so merge real process env vars here
+# (OPENAI_* doubles as the Groq/any OpenAI-compatible backend — see README).
+for _key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
+             "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"):
+    _val = os.environ.get(_key)
+    if _val:
+        cfg.env[_key] = _val.strip()
 STORE = DemoStore(cfg)
 
 
