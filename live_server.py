@@ -468,6 +468,10 @@ class DemoStore:
         # ignored one utterance at a time (still below the 35% owner rule), but
         # they must never pause the assistant, so disable the lockout here only.
         self.cfg.gate.lockout_after = 0
+        # Browser clips are much shorter than desktop captures, so a short
+        # owner phrase must still be scored and answered rather than silently
+        # "ignored". MIN_SECONDS (0.4 s) already guards against empty clips.
+        self.cfg.gate.min_utterance_sec = 0.2
         self._sessions: dict[str, DemoSession] = {}
         self._lock = threading.Lock()
         self._asr = None
@@ -726,26 +730,21 @@ class DemoStore:
                 }
 
             session.last_owner = time.time()
-            needs_wake = not session.conversation_open
+            was_closed = not session.conversation_open
             had_wake, command = split_wake(text)
 
-            if is_stop(command) and (not needs_wake or had_wake):
+            if is_stop(command) and (session.conversation_open or had_wake):
                 session.conversation_open = False
-                reply = "Okay, stopping. Say \u201cHey Lyra\u201d when you need me."
+                reply = "Okay, stopping. Just speak whenever you need me again."
                 session.history += [("user", text), ("bot", reply)]
                 return {
                     "ok": True, "owner": True, "transcript": text, "reply": reply,
                     "stop": True, "score": decision.score, **session.state(),
                 }
 
-            if needs_wake and not had_wake:
-                return {
-                    "ok": True, "owner": True, "transcript": text,
-                    "wake_required": True, "score": decision.score,
-                    "reply": "Say \u201cHey Lyra\u201d to start.",
-                    **session.state(),
-                }
-
+            # The owner's voice is enough to get an answer: open the conversation
+            # and reply straight away. "Hey Lyra" still works (and adds a greeting
+            # by name) but is no longer required before Lyra will talk back.
             session.conversation_open = True
             session.history.append(("user", text))
             session.history = session.history[-20:]
@@ -758,7 +757,7 @@ class DemoStore:
                     if hasattr(provider, "owner_name"):
                         provider.owner_name = session.name or "the owner"
 
-            if needs_wake:
+            if was_closed and had_wake:
                 hello = greeting(session.name, with_offer=not bool(command.strip()))
                 reply = f"{hello} {brain.reply(command, session.history)}" if command.strip() else hello
             else:
@@ -768,7 +767,7 @@ class DemoStore:
             session.history = session.history[-20:]
             return {
                 "ok": True, "owner": True, "transcript": text, "reply": reply,
-                "score": decision.score, "wake": needs_wake, **session.state(),
+                "score": decision.score, "wake": was_closed, **session.state(),
             }
 
     def timeout_sweep(self) -> None:

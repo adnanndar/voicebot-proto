@@ -39,7 +39,7 @@ const VAD = { start_ms: 300, end_ms: 1000, max_sec: 30 };
 
 const STATUS_LABELS = {
   idle: "Idle", listening: "Listening", verifying: "Checking your voice…",
-  thinking: "Thinking…", speaking: "Speaking…", standby: "Sleeping — say “Hey Lyra”",
+  thinking: "Thinking…", speaking: "Speaking…", standby: "Sleeping — just start talking",
   ignored: "Not the owner",
 };
 
@@ -214,7 +214,7 @@ function renderConversation(items) {
   const box = $("#conversation");
   box.innerHTML = "";
   if (!items || !items.length) {
-    box.innerHTML = '<div class="empty">Enrol your voice, then press <b>Start listening</b> and say “Hey Lyra”.</div>';
+    box.innerHTML = '<div class="empty">Enrol your voice, then press <b>Start listening</b> and speak.</div>';
     return;
   }
   for (const m of items) {
@@ -314,7 +314,7 @@ function applyState(s) {
 
   if (stage === "chat") {
     $("#hero-title").textContent = name ? `Ready when you are, ${name}` : "Ready when you are";
-    $("#hero-sub").textContent = "Press Start listening, then say “Hey Lyra”. I decide 1 second after you stop speaking.";
+    $("#hero-sub").textContent = "Press Start listening, then just speak — I answer only you. I decide 1 second after you stop speaking.";
     $("#btn-listen").textContent = listening ? "⏹ Stop" : "▶ Start listening";
   } else if (stage === "name") {
     $("#hero-title").textContent = "Welcome!";
@@ -617,8 +617,9 @@ function handleAskResult(res) {
   }
 
   if (res.wake_required) {
+    // Kept as a fallback only: the server no longer requires a wake word.
     showScore(res.score, true);
-    toast(res.reply || "Say “Hey Lyra” to start.");
+    toast(res.reply || "I heard you — speak again and I'll answer.");
     processing = false;
     startConvRec();
     setStatus("listening", "listening");
@@ -628,7 +629,7 @@ function handleAskResult(res) {
   applyState(res);
   showScore(res.score, true);
   if (res.stop) {
-    toast("Conversation closed. Say “Hey Lyra” to start again.");
+    toast("Conversation closed. Just speak again whenever you need me.");
     setStatus("speaking", "speaking");
     playServerVoice(res.reply, () => {
       processing = false;
