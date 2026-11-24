@@ -295,6 +295,12 @@ class DemoStore:
         self.cfg.debug.save_utterances = False
         # Live-only tuning; this copy is never written back to config.yaml.
         self.cfg.bot.asr_model = "base"  # much faster than "small", still accurate
+        # Browser push-to-record clips start/stop right at the speech, so short
+        # prompts ("Tell me a joke.", "Good morning.") are under the 1.0 s / 0.8 s
+        # floors the desktop capture was tuned for. Without this, enrolment gets
+        # stuck on the first short line and rejects every retry.
+        self.cfg.enrol.min_duration_sec = 0.5
+        self.cfg.enrol.min_speech_sec = 0.4
         self._sessions: dict[str, DemoSession] = {}
         self._lock = threading.Lock()
         self._asr = None
@@ -641,8 +647,15 @@ def api_tts(payload: dict):
 def api_enrol(payload: dict):
     session = STORE.get(payload.get("sid"))
     try:
-        return STORE.enrol(session, payload.get("audio", ""), payload.get("mime", ""))
+        result = STORE.enrol(session, payload.get("audio", ""), payload.get("mime", ""))
+        log.info(
+            "enrol sid=%s stage=%s ok=%s index=%s reason=%s",
+            session.id[:8], result.get("stage"), result.get("ok"),
+            result.get("index"), result.get("reason"),
+        )
+        return result
     except ValueError as e:
+        log.info("enrol sid=%s rejected: %s", session.id[:8], e)
         return {"ok": False, "reason": str(e), **session.state()}
     except Exception as e:
         log.exception("team enrolment failed")
