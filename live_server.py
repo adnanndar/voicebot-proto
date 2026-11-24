@@ -441,6 +441,10 @@ class DemoStore:
         # stuck on the first short line and rejects every retry.
         self.cfg.enrol.min_duration_sec = 0.5
         self.cfg.enrol.min_speech_sec = 0.4
+        # The shared demo must stay listening. Background voices and noise are
+        # ignored one utterance at a time (still below the 35% owner rule), but
+        # they must never pause the assistant, so disable the lockout here only.
+        self.cfg.gate.lockout_after = 0
         self._sessions: dict[str, DemoSession] = {}
         self._lock = threading.Lock()
         self._asr = None

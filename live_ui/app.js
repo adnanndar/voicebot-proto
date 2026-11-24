@@ -561,12 +561,9 @@ function handleAskResult(res) {
   }
 
   if (res.owner === false) {
+    // Background voices and noise: ignore this one utterance and keep listening
+    // for the owner. The live app never locks out, so it is never paused.
     showScore(res.score, false);
-    setStatus("ignored", "ignored");
-    const pct = res.score != null ? `${Math.round(res.score * 100)}% match` : "no match";
-    toast(res.decision === "locked"
-      ? `Paused — ${res.reason || "too many unknown attempts"}.`
-      : `That didn't sound like the enrolled voice (${pct}).`, true);
     processing = false;
     startConvRec();
     setStatus("listening", "listening");
