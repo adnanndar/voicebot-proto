@@ -389,8 +389,9 @@ class LiveASR(ASR):
 
 
 class DemoSession:
-    def __init__(self, sid: str, prompts: list[dict]):
+    def __init__(self, sid: str, prompts: list[dict], cfg: AttrDict):
         self.id = sid
+        self.cfg = cfg  # shared with the store, so settings are global
         self.stage = "name"
         self.name = ""
         self.prompts = prompts
@@ -426,6 +427,15 @@ class DemoSession:
             "conversation": [
                 {"role": role, "text": text} for role, text in self.history[-20:]
             ],
+            # Same settings the approved app exposes (sleep timer, owner rule).
+            "settings": {
+                "accept_threshold": float(self.cfg.gate.accept_threshold),
+                "reject_threshold": float(self.cfg.gate.reject_threshold),
+                "conversation_window_sec": float(self.cfg.gate.conversation_window_sec),
+                "timeout_minutes": float(self.cfg.timeout.minutes),
+                "timeout_enabled": bool(self.cfg.timeout.enabled),
+                "save_utterances": False,  # live sessions are never written to disk
+            },
         }
 
 
@@ -499,7 +509,7 @@ class DemoStore:
         if len(prompts) < SAMPLE_COUNT:
             raise RuntimeError("no prompts available")
         sid = uuid.uuid4().hex
-        session = DemoSession(sid, prompts)
+        session = DemoSession(sid, prompts, self.cfg)
         with self._lock:
             self._prune_locked()
             if len(self._sessions) >= MAX_SESSIONS:
@@ -527,6 +537,23 @@ class DemoStore:
             with self._lock:
                 self._sessions.pop(sid, None)
         return self._new()
+
+    def update_settings(self, payload: dict) -> None:
+        """Apply the same settings the approved app offers.
+
+        The owner rule stays fixed at 35% (the approved app deliberately does
+        not expose it), so a crafted request cannot weaken the voice check.
+        """
+        if "timeout_minutes" in payload:
+            try:
+                minutes = float(payload["timeout_minutes"])
+            except (TypeError, ValueError):
+                minutes = float(self.cfg.timeout.minutes)
+            self.cfg.timeout.minutes = max(1.0, min(60.0, minutes))
+        if "timeout_enabled" in payload:
+            self.cfg.timeout.enabled = bool(payload["timeout_enabled"])
+        # Live sessions are never written to disk.
+        self.cfg.debug.save_utterances = False
 
     def speak(self, text: str) -> str | None:
         return self._say(text)
@@ -722,6 +749,8 @@ class DemoStore:
             }
 
     def timeout_sweep(self) -> None:
+        if not bool(self.cfg.timeout.enabled):
+            return  # auto-sleep turned off in Settings
         minutes = float(self.cfg.timeout.minutes)
         cutoff = time.time() - minutes * 60
         with self._lock:
@@ -783,6 +812,18 @@ def api_start(payload: dict):
     session = STORE.reset(payload.get("sid"))
     question = NAME_QUESTION
     return {"ok": True, "question": question, "audio": STORE.speak(question), **session.state()}
+
+
+@app.post("/api/demo/settings")
+def api_settings(payload: dict):
+    """Update the approved settings (sleep timer, auto-sleep) for the live app."""
+    try:
+        STORE.update_settings(payload)
+        session = STORE.get(payload.get("sid"))
+        return {"ok": True, **session.state()}
+    except Exception as e:
+        log.exception("settings update failed")
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
 
 
 @app.post("/api/demo/tts")

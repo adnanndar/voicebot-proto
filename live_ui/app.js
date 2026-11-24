@@ -15,6 +15,8 @@ let name = "";
 let total = 10;
 let lastPrompt = "";
 let toastTimer = null;
+let dragging = false;          // true while the sleep-timer slider is dragged
+let acceptThreshold = 0.35;    // owner rule (fixed 35%, shown on the score bar)
 
 // ---- enrolment recording (push-to-record, same as the approved flow) ----
 let rec = null, recKind = null, recChunks = [], recStart = 0, recTimer = null,
@@ -239,9 +241,20 @@ function showScore(score, owner) {
   $("#score-block").hidden = false;
   $("#score-fill").style.width = (Math.max(0, Math.min(1, score)) * 100) + "%";
   $("#score-fill").className = "score-fill " + (owner ? "owner" : "other");
-  $("#score-thresh").style.left = "35%";
+  $("#score-thresh").style.left = (Math.max(0, Math.min(1, acceptThreshold)) * 100) + "%";
   $("#score-label").textContent =
     (owner ? "✓ it's you — " : "✗ not you — ") + (score * 100).toFixed(0) + "% match";
+}
+
+function setSlider(id, value) {
+  const el = $(id);
+  if (!el) return;
+  const v = Math.round(Number(value) || 1);
+  if (Math.abs(parseFloat(el.value) - v) > 0.001) {
+    el.value = String(v);
+    const out = $(id + "-out");
+    if (out) out.textContent = v;
+  }
 }
 
 function applyState(s) {
@@ -291,6 +304,17 @@ function applyState(s) {
   } else {
     $("#hero-title").textContent = name ? `Keep going, ${name}` : "Keep going";
     $("#hero-sub").textContent = "Read each line aloud to finish enrolment.";
+  }
+
+  // Settings (same controls as the approved app).
+  const st = s.settings || {};
+  if (st.accept_threshold != null) acceptThreshold = Number(st.accept_threshold);
+  if (!dragging) {
+    if (st.timeout_minutes != null) setSlider("#timeout", st.timeout_minutes);
+    const te = $("#timeout-enabled");
+    if (te) te.checked = !!st.timeout_enabled;
+    const su = $("#saveutt");
+    if (su) su.checked = false;
   }
 
   renderConversation(s.conversation || []);
@@ -725,6 +749,42 @@ $("#btn-delete").addEventListener("click", async () => {
     toast("Started over.");
   } catch (e) { toast(e.message, true); }
 });
+
+// ---------------------------------------------------------------- settings
+async function saveSettings(patch) {
+  try {
+    const res = await api("/api/demo/settings", { sid, ...patch });
+    applyState(res);
+  } catch (e) { toast(e.message, true); }
+}
+
+(function initSettings() {
+  const slider = $("#timeout");
+  const out = $("#timeout-out");
+  if (slider) {
+    slider.addEventListener("input", () => {
+      dragging = true;
+      if (out) out.textContent = slider.value;
+    });
+    slider.addEventListener("change", () => {
+      dragging = false;
+      saveSettings({ timeout_minutes: parseFloat(slider.value) });
+    });
+  }
+  const auto = $("#timeout-enabled");
+  if (auto) auto.addEventListener("change", () => saveSettings({ timeout_enabled: auto.checked }));
+
+  // Approved controls that do not apply to the shared live app: audio is never
+  // written to disk and there is no persistent profile to add samples to.
+  const hideLabel = (el) => {
+    const label = el && el.closest("label");
+    if (label) label.hidden = true;
+  };
+  hideLabel($("#saveutt"));
+  hideLabel($("#enrol-consent"));
+  const add = $("#btn-add");
+  if (add) add.hidden = true;
+})();
 
 // --------------------------------------------------------------------- boot
 (async function boot() {
