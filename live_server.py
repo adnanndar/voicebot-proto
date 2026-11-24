@@ -178,6 +178,26 @@ def decode_audio(b64: str, mime: str = "", name: str = "", sr: int = 16000) -> n
     return np.ascontiguousarray(audio, dtype=np.float32)
 
 
+def prep_enrol_audio(audio: np.ndarray) -> np.ndarray:
+    """Give near-full-scale browser recordings some headroom.
+
+    Phone/desktop browsers apply automatic gain control, so ordinary speech
+    routinely peaks at full scale (0.99+). `validate` treats any such peak as
+    clipping, which then blocks enrolment forever with "move further from the
+    mic". Scaling those takes down to 0.7 keeps the speech intact (and is the
+    same level `speaker.embed` already normalises to), so the check no longer
+    fires on AGC audio. Quiet takes are left untouched, so "move closer" still
+    works for genuinely low recordings.
+    """
+    a = np.asarray(audio, dtype=np.float32)
+    if a.size == 0:
+        return a
+    peak = float(np.max(np.abs(a)))
+    if peak >= 0.95:
+        a = a * (0.7 / peak)
+    return a
+
+
 # ------------------------------------------------------------------------ TTS
 def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
     text = (text or "").strip()[:800]
@@ -395,7 +415,7 @@ class DemoStore:
         return audio
 
     def enrol(self, session: DemoSession, b64: str, mime: str) -> dict:
-        audio = self._audio(b64, mime)
+        audio = prep_enrol_audio(self._audio(b64, mime))
         with session.lock:
             if session.stage == "chat":
                 return {"ok": False, "reason": "you are already enrolled", **session.state()}
