@@ -696,7 +696,8 @@ class DetectifGate:
     def __init__(self, client: DetectifSpeaker, speaker_id: str):
         self.client = client
         self.speaker_id = speaker_id
-        self.display_threshold = (0.53 + 1.0) / 2.0
+        self.raw_threshold = 0.53
+        self.display_threshold = (self.raw_threshold + 1.0) / 2.0
 
     def decide(self, utt: Utterance) -> Decision:
         try:
@@ -706,18 +707,23 @@ class DetectifGate:
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
             lowered = message.lower()
-            if any(word in lowered for word in ("too short", "insufficient speech", "at least 2 seconds", "3–60 seconds")):
+            if any(word in lowered for word in (
+                "too short", "insufficient speech", "at least 2 seconds",
+                "at least 3 seconds", "3–60 seconds", "unprocessable_audio",
+            )):
                 return Decision(False, None, "ignored", message, "short")
             log.warning("detectif verification failed: %s", exc)
             return Decision(False, None, "not_owner", "speaker check unavailable", "detectif")
         raw = result["similarity"]  # Detectif score is [-1, 1], not a percentage.
-        self.display_threshold = (result["threshold"] + 1.0) / 2.0
-        display_score = max(0.0, min(1.0, (raw + 1.0) / 2.0))
-        owner = result["decision"] == "match"
+        self.raw_threshold = result["threshold"]
+        self.display_threshold = (self.raw_threshold + 1.0) / 2.0
+        # Enforce the provider's returned threshold ourselves as well; never
+        # accept merely because the response string says "match".
+        owner = result["decision"] == "match" and raw >= self.raw_threshold
         return Decision(
-            owner, round(display_score, 4),
+            owner, round(float(raw), 4),
             "owner" if owner else "not_owner",
-            f"Detectif decision: {result['decision']}; similarity {raw:.3f}",
+            f"Detectif {result['decision']}; similarity {raw:.3f}; threshold {self.raw_threshold:.3f}",
             "detectif",
         )
 
@@ -754,9 +760,14 @@ class DemoSession:
         return ""
 
     def state(self) -> dict:
+        detectif_threshold = (
+            self.gate.raw_threshold if isinstance(self.gate, DetectifGate) else 0.53
+        )
         score_threshold = (
             self.gate.display_threshold
             if isinstance(self.gate, DetectifGate)
+            else (detectif_threshold + 1.0) / 2.0
+            if self.speaker_provider == "detectif"
             else float(self.cfg.gate.accept_threshold)
         )
         return {
@@ -778,6 +789,9 @@ class DemoSession:
             # Same settings the approved app exposes (sleep timer, owner rule).
             "settings": {
                 "accept_threshold": float(score_threshold),
+                "detectif_threshold": (
+                    float(detectif_threshold) if self.speaker_provider == "detectif" else None
+                ),
                 "reject_threshold": float(self.cfg.gate.reject_threshold),
                 "conversation_window_sec": float(self.cfg.gate.conversation_window_sec),
                 "timeout_minutes": float(self.cfg.timeout.minutes),

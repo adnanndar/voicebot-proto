@@ -20,6 +20,8 @@ let acceptThreshold = 0.35;    // fixed owner rule, shown on the score bar
 let enrolOpen = false;         // show enrolment only after the user asks to enrol
 let conversationOpen = false;
 let addingSamples = false;     // true while the "Add samples" pass is running
+let speakerProvider = "ecapa";
+let detectifThreshold = 0.53;
 
 // ---- enrolment recording (push-to-record, same as the approved flow) ----
 let rec = null, recKind = null, recChunks = [], recStart = 0, recTimer = null,
@@ -242,17 +244,23 @@ function updateSteps(which) {
 function showScore(score, owner) {
   if (score == null) { $("#score-block").hidden = true; return; }
   $("#score-block").hidden = false;
-  $("#score-fill").style.width = (Math.max(0, Math.min(1, score)) * 100) + "%";
+  const displayScore = speakerProvider === "detectif" ? (score + 1) / 2 : score;
+  $("#score-fill").style.width = (Math.max(0, Math.min(1, displayScore)) * 100) + "%";
   $("#score-fill").className = "score-fill " + (owner ? "owner" : "other");
   $("#score-thresh").style.left = (Math.max(0, Math.min(1, acceptThreshold)) * 100) + "%";
-  $("#score-label").textContent =
-    (owner ? "✓ it's you — " : "✗ not you — ") + (score * 100).toFixed(0) + "% match";
+  $("#score-label").textContent = speakerProvider === "detectif"
+    ? (owner ? "✓ it's you — " : "✗ not you — ") +
+      `similarity ${score.toFixed(2)} (not a probability)`
+    : (owner ? "✓ it's you — " : "✗ not you — ") + (score * 100).toFixed(0) + "% match";
   updateScoreHint();
 }
 
 function updateScoreHint() {
   const hint = $(".score-hint");
-  if (hint) hint.textContent = `owner = ${Math.round(acceptThreshold * 100)}% or higher`;
+  if (!hint) return;
+  hint.textContent = speakerProvider === "detectif"
+    ? `Detectif match threshold = ${detectifThreshold.toFixed(2)} similarity (not a probability)`
+    : `owner = ${Math.round(acceptThreshold * 100)}% or higher`;
 }
 
 function setSlider(id, value) {
@@ -272,6 +280,7 @@ function applyState(s) {
   name = s.name || "";
   total = s.total || 10;
   conversationOpen = !!s.conversation_open;
+  speakerProvider = s.speaker_provider || "ecapa";
   if (stage === "chat") enrolOpen = false;
 
   $("#vp-pill").textContent = stage === "chat" ? "enrolled ✓" : "not enrolled";
@@ -323,6 +332,7 @@ function applyState(s) {
 
   // The live Settings panel has one control: idle time before sleep.
   const st = s.settings || {};
+  if (st.detectif_threshold != null) detectifThreshold = Number(st.detectif_threshold);
   if (st.accept_threshold != null) acceptThreshold = Number(st.accept_threshold);
   if (!dragging) {
     if (st.timeout_minutes != null) setSlider("#timeout", st.timeout_minutes);
@@ -609,6 +619,7 @@ function handleAskResult(res) {
     // Background voices and noise: ignore this one utterance and keep listening
     // for the owner. The live app never locks out, so it is never paused.
     if (res.decision === "ignored" && res.reason) toast(res.reason);
+    speakerProvider = res.speaker_provider || speakerProvider;
     showScore(res.score, false);
     conversationOpen = !!res.conversation_open;
     processing = false;
