@@ -27,6 +27,9 @@ mlx-lm>=0.20; sys_platform == "darwin" and platform_machine == "arm64"
 cryptography>=41
 # eval (ticket 6) — ROC/DET plots (optional; CSV still written without it)
 matplotlib>=3.7
+# live server — speaker recognition via Picovoice Eagle (replaces ECAPA when a
+# PICOVOICE_ACCESS_KEY is set; ECAPA/torch stays as the fallback otherwise).
+pveagle>=3.0
 # live server — keep the macOS speech engine warm so the spoken reply starts
 # right after the text instead of a couple of seconds later (say fallback still
 # works without it). Linux/cloud installs skip this.

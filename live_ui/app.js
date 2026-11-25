@@ -16,8 +16,10 @@ let total = 10;
 let lastPrompt = "";
 let toastTimer = null;
 let dragging = false;          // true while the sleep-timer slider is dragged
-let draggingThreshold = false; // true while the owner-threshold slider is dragged
-let acceptThreshold = 0.35;    // owner rule (35% default, shown on the score bar)
+let acceptThreshold = 0.35;    // fixed owner rule, shown on the score bar
+let enrolOpen = false;         // show enrolment only after the user asks to enrol
+let conversationOpen = false;
+let addingSamples = false;     // true while the "Add samples" pass is running
 
 // ---- enrolment recording (push-to-record, same as the approved flow) ----
 let rec = null, recKind = null, recChunks = [], recStart = 0, recTimer = null,
@@ -264,30 +266,21 @@ function setSlider(id, value) {
   }
 }
 
-function setThreshold(value) {
-  const el = $("#threshold");
-  if (!el) return;
-  const pct = Math.round(Number(value) * 100);
-  if (Math.abs(parseFloat(el.value) - pct) > 0.5) {
-    el.value = String(pct);
-    const out = $("#threshold-out");
-    if (out) out.textContent = pct + "%";
-  }
-}
-
 function applyState(s) {
   saveSid(s.sid);
   stage = s.stage || "name";
   name = s.name || "";
   total = s.total || 10;
+  conversationOpen = !!s.conversation_open;
+  if (stage === "chat") enrolOpen = false;
 
   $("#vp-pill").textContent = stage === "chat" ? "enrolled ✓" : "not enrolled";
   $("#vp-pill").className = "pill" + (stage === "chat" ? " ok" : "");
   $("#vp-meta").textContent = stage === "chat"
-    ? `${name ? name + " · " : ""}${total} samples · answers only to you`
+    ? `${name ? name + " · " : ""}${s.num_samples || total} samples · answers only to you`
     : "Enrol once so the assistant only answers you.";
 
-  $("#enrol-card").hidden = stage === "chat";
+  $("#enrol-card").hidden = !enrolOpen || stage === "chat";
   $("#name-stage").hidden = stage !== "name";
   $("#prompt-stage").hidden = stage !== "prompts";
 
@@ -323,21 +316,18 @@ function applyState(s) {
     $("#hero-title").textContent = name ? `Keep going, ${name}` : "Keep going";
     $("#hero-sub").textContent = "Read each line aloud to finish enrolment.";
   }
+  const stepTitle = $('.steps [data-step="3"] b');
+  const stepHint = $('.steps [data-step="3"] small');
+  if (stepTitle) stepTitle.textContent = "Speak naturally";
+  if (stepHint) stepHint.textContent = "I answer when I recognize your voice";
 
-  // Settings (same controls as the approved app, plus the live threshold).
+  // The live Settings panel has one control: idle time before sleep.
   const st = s.settings || {};
   if (st.accept_threshold != null) acceptThreshold = Number(st.accept_threshold);
   if (!dragging) {
     if (st.timeout_minutes != null) setSlider("#timeout", st.timeout_minutes);
-    const te = $("#timeout-enabled");
-    if (te) te.checked = !!st.timeout_enabled;
-    const su = $("#saveutt");
-    if (su) su.checked = false;
   }
-  if (!draggingThreshold && st.accept_threshold != null) {
-    setThreshold(st.accept_threshold);
-    updateScoreHint();
-  }
+  updateScoreHint();
 
   renderConversation(s.conversation || []);
   updateSteps(stage);
@@ -440,6 +430,15 @@ function handleEnrolResult(res) {
     return;
   }
   if (res.done && res.ok) {
+    if (addingSamples) {
+      $("#enrol-result").textContent = `✓ samples added — ${res.num_samples || total} samples total, recognition sharper.`;
+      $("#enrol-result").className = "result ok";
+      addingSamples = false;
+      applyState(res);
+      toast("✓ Voice samples added.");
+      playClip(res.prompt_audio, "Samples added. Recognition is sharper now.");
+      return;
+    }
     $("#enrol-result").textContent = `✓ all done! I'll call you ${res.name || ""}. ${res.num_samples || total} samples saved.`;
     $("#enrol-result").className = "result ok";
     applyState(res);
@@ -610,9 +609,10 @@ function handleAskResult(res) {
     // Background voices and noise: ignore this one utterance and keep listening
     // for the owner. The live app never locks out, so it is never paused.
     showScore(res.score, false);
+    conversationOpen = !!res.conversation_open;
     processing = false;
     startConvRec();
-    setStatus("listening", "listening");
+    setStatus(conversationOpen ? "listening" : "standby", conversationOpen ? "listening" : "");
     return;
   }
 
@@ -642,7 +642,10 @@ function handleAskResult(res) {
       if (resumed) return;
       resumed = true;
       processing = false;
-      if (listening) { startConvRec(); setStatus("listening", "listening"); }
+      if (listening) {
+        startConvRec();
+        setStatus(conversationOpen ? "listening" : "standby", conversationOpen ? "listening" : "");
+      }
     };
     if (res.audio) {
       const a = new Audio("data:audio/wav;base64," + res.audio);
@@ -688,7 +691,7 @@ async function startListening(miccheck) {
   lastFrameTime = 0;
   startConvRec();
   if (!convRec) return;  // recording failed — startConvRec already reset the UI
-  setStatus("listening", "listening");
+  setStatus(conversationOpen ? "listening" : "standby", conversationOpen ? "listening" : "");
   $("#speech-text").textContent = "listening…";
   $("#btn-listen").textContent = "⏹ Stop";
 }
@@ -715,15 +718,38 @@ function stopListening() {
 
 // -------------------------------------------------------------------- wiring
 $("#btn-enrol").addEventListener("click", async () => {
+  const consent = $("#enrol-consent");
+  if (consent && !consent.checked) {
+    toast("Please tick the consent box first.", true);
+    return;
+  }
   try {
     busy = true;
+    addingSamples = false;
     const res = await api("/api/demo/start", { sid });
+    enrolOpen = true;
     lastPrompt = "";
     $("#enrol-result").textContent = "";
     $("#enrol-result").className = "result";
     $("#conversation").innerHTML = "";
     applyState(res);
     playClip(res.audio, res.question || "What is your name?");
+  } catch (e) { toast(e.message, true); }
+  finally { busy = false; }
+});
+
+$("#btn-add").addEventListener("click", async () => {
+  if (stage !== "chat") { toast("Enrol your voice first, then add samples.", true); return; }
+  try {
+    busy = true;
+    addingSamples = true;
+    const res = await api("/api/demo/add", { sid });
+    enrolOpen = true;
+    lastPrompt = "";
+    $("#enrol-result").textContent = "Read each line aloud to sharpen recognition.";
+    $("#enrol-result").className = "result";
+    applyState(res);
+    playClip(res.prompt_audio, res.prompt);
   } catch (e) { toast(e.message, true); }
   finally { busy = false; }
 });
@@ -751,10 +777,8 @@ $("#btn-miccheck").addEventListener("click", () => {
 });
 
 $("#btn-cancel").addEventListener("click", async () => {
-  try {
-    await api("/api/demo/start", { sid });
-    applyState(await apiGet("/api/demo/session?sid=" + encodeURIComponent(sid)));
-  } catch (e) { toast(e.message, true); }
+  enrolOpen = false;
+  $("#enrol-card").hidden = true;
 });
 
 $("#btn-delete").addEventListener("click", async () => {
@@ -762,6 +786,7 @@ $("#btn-delete").addEventListener("click", async () => {
   try {
     if (listening) stopListening();
     const res = await api("/api/demo/start", { sid });
+    enrolOpen = false;
     localStorage.removeItem(SID_KEY);
     sid = "";
     lastPrompt = "";
@@ -795,34 +820,14 @@ async function saveSettings(patch) {
     });
   }
   const auto = $("#timeout-enabled");
-  if (auto) auto.addEventListener("change", () => saveSettings({ timeout_enabled: auto.checked }));
+  if (auto) auto.remove();
 
-  const th = $("#threshold");
-  const thOut = $("#threshold-out");
-  if (th) {
-    th.addEventListener("input", () => {
-      draggingThreshold = true;
-      acceptThreshold = parseFloat(th.value) / 100;
-      if (thOut) thOut.textContent = th.value + "%";
-      updateScoreHint();
-      $("#score-thresh").style.left = (Math.max(0, Math.min(1, acceptThreshold)) * 100) + "%";
-    });
-    th.addEventListener("change", () => {
-      draggingThreshold = false;
-      saveSettings({ accept_threshold: parseFloat(th.value) / 100 });
-    });
-  }
-
-  // Approved controls that do not apply to the shared live app: audio is never
-  // written to disk and there is no persistent profile to add samples to.
+  // Controls that don't apply to the live app: audio is never written to disk.
   const hideLabel = (el) => {
     const label = el && el.closest("label");
     if (label) label.hidden = true;
   };
   hideLabel($("#saveutt"));
-  hideLabel($("#enrol-consent"));
-  const add = $("#btn-add");
-  if (add) add.hidden = true;
 })();
 
 // --------------------------------------------------------------------- boot
@@ -843,3 +848,16 @@ async function saveSettings(patch) {
     setStatus("idle");
   } catch (e) { toast("Could not reach Lyra.", true); }
 })();
+
+// Refresh only the conversation/sleep state while the mic is armed. The server
+// keeps monitoring for the owner during standby; this just updates the UI after
+// the one-minute idle timer closes the conversation.
+setInterval(async () => {
+  if (!listening || processing || miccheckMode || vadState !== "idle" || !sid) return;
+  try {
+    const s = await apiGet("/api/demo/session?sid=" + encodeURIComponent(sid));
+    if (s.sid !== sid) return;
+    conversationOpen = !!s.conversation_open;
+    setStatus(conversationOpen ? "listening" : "standby", conversationOpen ? "listening" : "");
+  } catch (_) {}
+}, 5000);

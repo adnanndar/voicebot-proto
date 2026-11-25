@@ -3,7 +3,7 @@
 
 A self-contained web app so teammates can talk to Lyra from their own browser,
 using their own microphone and voice. It reuses the assistant's speech models
-and behaviour (the "Hey Lyra" wake word, the 35% owner rule, greeting by name)
+and behaviour (the 35% owner rule and optional greeting by name)
 but is otherwise independent of the private, owner-only assistant:
 
   * nothing here reads or writes the owner's voiceprint or data/,
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import io
 import json
 import logging
 import os
@@ -41,40 +42,27 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.bot.asr import ASR
 from app.bot.brain import (
     USER_AGENT,
     OpenAICompatBrain,
     _build_messages,
     _clean,
+    _SYSTEM,
     _system_for,
     make_brain,
 )
 from app.config import ROOT, AttrDict, load_config
 from app.enrol.prompts import pick_prompts
 from app.enrol.validate import validate
-from app.enrol.voiceprint import enrol, parse_spoken_name, trim_to_speech
+from app.enrol.voiceprint import add_samples, enrol, parse_spoken_name, trim_to_speech
 from app.gate.gate import SpeakerGate
-from app.types import Utterance
+from app.types import Decision, Utterance
 
 log = logging.getLogger("team")
 logging.basicConfig(level=logging.INFO)
 
 UI_DIR = ROOT / "ui"          # the approved UI (index.html + style.css), read-only
 LIVE_UI_DIR = ROOT / "live_ui"  # browser-mic app.js for the live version
-
-# Extra Settings control for the live app. The approved HTML is served
-# byte-for-byte apart from this one injected block, so the owner rule can be
-# tuned here without editing the approved `ui/index.html`.
-THRESHOLD_CONTROL = (
-    '          <label class="field">Owner threshold (%)\n'
-    '            <input type="range" id="threshold" min="20" max="90" step="1" />\n'
-    '            <output id="threshold-out"></output>\n'
-    '          </label>\n'
-)
-ANCHOR_CONTROL = (
-    '          <label class="toggle"><input type="checkbox" id="timeout-enabled" /> auto-sleep when idle</label>\n'
-)
 
 SAMPLE_COUNT = 10
 SESSION_TTL = 2 * 60 * 60
@@ -327,7 +315,30 @@ def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
     voice = cfg.bot.get("tts_voice")
     with tempfile.TemporaryDirectory(prefix="lyra_tts_") as tmp:
         wav = Path(tmp) / "out.wav"
-        # macOS: the system `say` voice, kept warm between replies.
+        # Preferred: neural TTS via the edge-tts API (free, no key). This moves
+        # the spoken voice to the cloud instead of the local macOS `say`.
+        try:
+            import asyncio
+
+            import edge_tts
+
+            tts_voice = (cfg.env.get("TTS_VOICE") or "en-US-AriaNeural").strip()
+            mp3 = Path(tmp) / "tts.mp3"
+
+            async def _gen():
+                await edge_tts.Communicate(text, tts_voice).save(str(mp3))
+
+            asyncio.run(_gen())
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3),
+                 "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
+                check=True, capture_output=True, timeout=timeout,
+            )
+            return wav.read_bytes()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("edge-tts failed (%s); falling back to local say", exc)
+
+        # Fallback: the macOS system `say` voice, kept warm between replies.
         if sys.platform == "darwin":
             try:
                 audio = _warm_voice(voice).speak(text)
@@ -350,26 +361,7 @@ def speech_wav(text: str, cfg: AttrDict, timeout: float = 30.0) -> bytes | None:
                 return wav.read_bytes()
             except (subprocess.SubprocessError, OSError):
                 return None
-        # cloud (Linux, etc.): free neural TTS, no API key required.
-        try:
-            import asyncio
-
-            import edge_tts
-
-            mp3 = Path(tmp) / "tts.mp3"
-
-            async def _gen():
-                await edge_tts.Communicate(text, "en-US-AriaNeural").save(str(mp3))
-
-            asyncio.run(_gen())
-            subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3),
-                 "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
-                check=True, capture_output=True, timeout=timeout,
-            )
-            return wav.read_bytes()
-        except Exception:
-            return None
+        return None
 
 
 def wav_to_mp3(wav: bytes) -> bytes | None:
@@ -388,26 +380,155 @@ def wav_to_mp3(wav: bytes) -> bytes | None:
 
 
 # --------------------------------------------------------------------- session
-class LiveASR(ASR):
-    """ASR that prefers the Apple Metal GPU, falling back to CPU.
+class GroqASR:
+    """Speech-to-text via the Groq transcription API (OpenAI-compatible).
 
-    Kept in this file so the owner app's `app/bot/asr.py` stays exactly as it
-    was approved — this only speeds up the live team server.
+    Replaces the local faster-whisper model so the server no longer loads
+    Whisper into memory — audio is transcribed by Groq's free `whisper` endpoint
+    instead. Keeps the same `transcribe(audio) -> (text, info)` interface the
+    rest of the app calls, so only this class changes.
     """
 
-    def _get(self):
-        if self._model is not None:
-            return self._model
-        from faster_whisper import WhisperModel
+    def __init__(self, cfg: AttrDict):
+        key = (cfg.env.get("OPENAI_API_KEY") or "").strip()
+        base = (cfg.env.get("OPENAI_BASE_URL") or "https://api.groq.com/openai/v1").strip()
+        self.api_key = key
+        self.url = base.rstrip("/") + "/audio/transcriptions"
+        self.model = (cfg.env.get("OPENAI_ASR_MODEL") or "whisper-large-v3-turbo").strip()
 
-        last_err = None
-        for device in ("mps", "cpu"):
-            try:
-                self._model = WhisperModel(self.model_name, device=device, compute_type="int8")
-                return self._model
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-        raise RuntimeError(f"could not load whisper model: {last_err}")
+    def transcribe(self, audio: np.ndarray) -> tuple[str, dict]:
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if audio.size == 0 or not self.api_key:
+            return "", {"language": "en"}
+        peak = float(np.max(np.abs(audio)))
+        if peak > 1e-6:
+            audio = (audio / peak * 0.95).astype(np.float32)
+        try:
+            import soundfile as sf
+
+            buf = io.BytesIO()
+            sf.write(buf, audio, 16000, format="WAV", subtype="PCM_16")
+            wav = buf.getvalue()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not encode audio for groq asr: %s", exc)
+            return "", {"language": "en"}
+
+        boundary = "----lyra" + uuid.uuid4().hex
+        head = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode()
+        fields = [
+            ("model", self.model),
+            ("language", "en"),
+            ("response_format", "json"),
+            ("temperature", "0"),
+        ]
+        tail = b"".join(
+            (
+                f"\r\n--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}'
+            ).encode()
+            for name, value in fields
+        )
+        body = head + wav + tail + f"\r\n--{boundary}--\r\n".encode()
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": USER_AGENT,
+        }
+        req = urllib.request.Request(self.url, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=25.0) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            return str(data.get("text") or "").strip(), {"language": "en"}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("groq asr failed: %s", exc)
+            return "", {"language": "en"}
+
+
+# ------------------------------------------------------------- speaker (Eagle)
+class EagleSpeaker:
+    """Picovoice Eagle speaker recognition (free, on-device, no torch).
+
+    Replaces ECAPA: builds a compact speaker profile at enrolment and returns a
+    similarity score per utterance at verification time. Loaded lazily so the
+    pveagle package and Access Key are only needed when enabled.
+    """
+
+    def __init__(self, access_key: str, threshold: float = 0.4):
+        self.access_key = access_key
+        self.threshold = threshold
+
+    @staticmethod
+    def _to_pcm16(audio: np.ndarray) -> list[int]:
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 1e-6:
+            audio = audio * (0.95 / peak)
+        return np.clip(audio * 32767.0, -32768, 32767).astype(np.int16).tolist()
+
+    def enroll(self, recordings: list[np.ndarray]) -> bytes:
+        import pveagle
+
+        profiler = pveagle.create_profiler(access_key=self.access_key)
+        try:
+            for rec in recordings:
+                profiler.enroll(self._to_pcm16(rec))
+            return profiler.export().to_bytes()
+        finally:
+            profiler.delete()
+
+    def verify(self, profile_bytes: bytes, audio: np.ndarray) -> float | None:
+        import pveagle
+
+        profile = pveagle.EagleProfile.from_bytes(profile_bytes)
+        recognizer = pveagle.create_recognizer(
+            access_key=self.access_key, speaker_profiles=[profile]
+        )
+        try:
+            scores = recognizer.process(self._to_pcm16(audio))
+            return float(scores[0]) if scores else None
+        finally:
+            recognizer.delete()
+
+
+class EagleGate:
+    """Speaker gate that uses Eagle instead of ECAPA.
+
+    Mirrors `SpeakerGate.decide` so the ask() flow needs no other changes:
+    returns a `Decision` (owner / not_owner / ignored) from an Eagle similarity
+    score against the enrolled profile.
+    """
+
+    def __init__(self, speaker: EagleSpeaker, profile_bytes: bytes, min_utt: float):
+        self.speaker = speaker
+        self.profile_bytes = profile_bytes
+        self.min_utt = min_utt
+
+    def decide(self, utt: Utterance) -> Decision:
+        if utt.duration_s < self.min_utt:
+            return Decision(False, None, "ignored", "too short to score reliably", "short")
+        try:
+            score = self.speaker.verify(self.profile_bytes, utt.audio)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("eagle verify failed: %s", exc)
+            return Decision(False, None, "not_owner", "speaker check unavailable", "eagle")
+        if score is None:
+            return Decision(False, None, "not_owner", "no speech detected", "eagle")
+        owner = score >= self.speaker.threshold
+        pct = int(round(max(0.0, min(1.0, score)) * 100))
+        return Decision(
+            owner, round(float(score), 4),
+            "owner" if owner else "not_owner",
+            f"eagle score {pct}% {'>=' if owner else '<'} threshold",
+            "eagle",
+        )
 
 
 class DemoSession:
@@ -415,12 +536,15 @@ class DemoSession:
         self.id = sid
         self.cfg = cfg  # shared with the store, so settings are global
         self.stage = "name"
+        self.mode = "enrol"  # "enrol" (fresh) or "add" (strengthen an existing print)
         self.name = ""
         self.prompts = prompts
         self.prompt_index = 0
         self.takes: list[np.ndarray] = []
         self.voiceprint: np.ndarray | None = None
+        self.meta: dict | None = None
         self.gate: SpeakerGate | None = None
+        self.enrol_clips: list[np.ndarray] = []  # kept for Eagle "add samples"
         self.conversation_open = False
         self.history: list[tuple[str, str]] = []
         self.lock = threading.Lock()
@@ -439,12 +563,14 @@ class DemoSession:
         return {
             "sid": self.id,
             "stage": self.stage,
+            "mode": self.mode,
             "name": self.name,
             "prompt": self.current_prompt if self.stage == "prompts" else (
                 NAME_QUESTION if self.stage == "name" else ""
             ),
             "index": self.prompt_index,
             "total": len(self.prompts),
+            "num_samples": int((self.meta or {}).get("num_samples", 0)),
             "conversation_open": self.conversation_open,
             "conversation": [
                 {"role": role, "text": text} for role, text in self.history[-20:]
@@ -459,6 +585,19 @@ class DemoSession:
                 "save_utterances": False,  # live sessions are never written to disk
             },
         }
+
+
+def _live_system(owner: str) -> str:
+    """System prompt for the live app: same as the approved one, but the model
+    must NOT pepper every answer with the owner's name."""
+    named = bool(owner) and str(owner).strip().lower() not in {"", "owner", "the owner"}
+    text = _SYSTEM.format(owner=owner or "the owner")
+    if named:
+        text += (
+            f" The owner's name is {owner}. Never address them by name in your "
+            "answers unless they explicitly ask for their name."
+        )
+    return text
 
 
 class LiveHostedBrain(OpenAICompatBrain):
@@ -485,7 +624,7 @@ class LiveHostedBrain(OpenAICompatBrain):
         self.timeout = timeout
 
     def reply(self, transcript: str, history: list, context: str = "") -> str:
-        system = _system_for(self.owner_name)
+        system = _live_system(self.owner_name)
         if context:
             system += "\n\n" + context
         payload = {
@@ -533,6 +672,12 @@ class DemoStore:
     def __init__(self, cfg: AttrDict):
         self.cfg = copy.deepcopy(cfg)
         self.cfg.debug.save_utterances = False
+        # Live app defaults: always sleep after one idle minute. The owner
+        # threshold remains fixed internally and is not user-adjustable.
+        self.cfg.timeout.minutes = 1.0
+        self.cfg.timeout.enabled = True
+        self.cfg.gate.accept_threshold = 0.35
+        self.cfg.gate.reject_threshold = 0.35
         # Live-only tuning; this copy is never written back to config.yaml.
         self.cfg.bot.asr_model = "base"  # much faster than "small", still accurate
         # Browser push-to-record clips start/stop right at the speech, so short
@@ -549,6 +694,12 @@ class DemoStore:
         # owner phrase must still be scored and answered rather than silently
         # "ignored". MIN_SECONDS (0.4 s) already guards against empty clips.
         self.cfg.gate.min_utterance_sec = 0.2
+        # Speaker recognition: use Picovoice Eagle (free, on-device, no torch)
+        # when a key is configured; otherwise keep ECAPA exactly as before.
+        self.eagle_key = (cfg.env.get("PICOVOICE_ACCESS_KEY") or "").strip()
+        self.eagle_threshold = float(cfg.env.get("EAGLE_THRESHOLD") or 0.4)
+        self.use_eagle = bool(self.eagle_key)
+        self._eagle = EagleSpeaker(self.eagle_key, self.eagle_threshold) if self.use_eagle else None
         self._sessions: dict[str, DemoSession] = {}
         self._lock = threading.Lock()
         self._asr = None
@@ -563,7 +714,7 @@ class DemoStore:
     def _asr_engine(self):
         with self._asr_lock:
             if self._asr is None:
-                self._asr = LiveASR(self.cfg)
+                self._asr = GroqASR(self.cfg)
             return self._asr
 
     def _brain_engine(self):
@@ -634,29 +785,14 @@ class DemoStore:
         return self._new()
 
     def update_settings(self, payload: dict) -> None:
-        """Apply the same settings the approved app offers, plus the live-only
-        owner-threshold slider (kept between 20% and 90% so the voice check
-        can be tuned but never dropped or made impossibly strict)."""
-        if "accept_threshold" in payload:
-            try:
-                t = float(payload["accept_threshold"])
-            except (TypeError, ValueError):
-                t = float(self.cfg.gate.accept_threshold)
-            t = max(0.20, min(0.90, t))
-            self.cfg.gate.accept_threshold = t
-            with self._lock:
-                sessions = list(self._sessions.values())
-            for session in sessions:
-                if session.gate is not None:
-                    session.gate.accept = t
+        """The single live setting controls the idle-sleep interval."""
         if "timeout_minutes" in payload:
             try:
                 minutes = float(payload["timeout_minutes"])
             except (TypeError, ValueError):
                 minutes = float(self.cfg.timeout.minutes)
             self.cfg.timeout.minutes = max(1.0, min(60.0, minutes))
-        if "timeout_enabled" in payload:
-            self.cfg.timeout.enabled = bool(payload["timeout_enabled"])
+        self.cfg.timeout.enabled = True
         # Live sessions are never written to disk.
         self.cfg.debug.save_utterances = False
 
@@ -729,18 +865,51 @@ class DemoStore:
             session.prompt_index += 1
 
             if session.prompt_index >= len(session.prompts):
-                vec, meta = enrol(session.takes, self.cfg.speaker.model, self.cfg)
-                session.voiceprint = vec
-                session.gate = SpeakerGate(self.cfg, vec)
+                if self.use_eagle:
+                    # Picovoice Eagle: build/refresh a compact speaker profile.
+                    clips = (
+                        session.enrol_clips + session.takes
+                        if session.mode == "add" else session.takes
+                    )
+                    try:
+                        profile_bytes = self._eagle.enroll(clips)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("eagle enrol failed")
+                        return {"ok": False, "reason": f"voice enrolment failed: {exc}", **session.state()}
+                    session.voiceprint = profile_bytes
+                    session.meta = {"num_samples": len(clips)}
+                    session.gate = EagleGate(
+                        self._eagle, profile_bytes, self.cfg.gate.min_utterance_sec
+                    )
+                    session.enrol_clips = clips
+                    done_note = (
+                        "Added samples — recognition is sharper now."
+                        if session.mode == "add"
+                        else f"Nice to meet you, {session.name}. Ask me anything."
+                    )
+                else:
+                    model = self.cfg.speaker.model
+                    if session.mode == "add" and session.voiceprint is not None:
+                        vec, meta = add_samples(
+                            session.voiceprint, session.meta or {"num_samples": 0},
+                            session.takes, model, self.cfg,
+                        )
+                        done_note = "Added samples — recognition is sharper now."
+                    else:
+                        vec, meta = enrol(session.takes, model, self.cfg)
+                        done_note = f"Nice to meet you, {session.name}. Ask me anything."
+                    session.voiceprint = vec
+                    session.meta = meta
+                    session.gate = SpeakerGate(self.cfg, vec)
                 session.stage = "chat"
+                session.mode = "enrol"
                 session.takes = []
                 session.last_owner = time.time()
                 return {
                     "ok": True, "done": True, "stage": "chat", "name": session.name,
                     "transcript": transcript, "words": words,
-                    "prompt_audio": self._say(
-                        f"Nice to meet you, {session.name}. Ask me anything."
-                    ),
+                    "num_samples": session.meta.get("num_samples"),
+                    "prompt_audio": self._say(done_note),
                     **session.state(),
                 }
 
@@ -750,6 +919,26 @@ class DemoStore:
                 "words": words, "prompt": prompt, "prompt_audio": self._say(prompt),
                 **session.state(),
             }
+
+    def add_samples_start(self, session: DemoSession) -> dict:
+        """Start an 'add more samples' pass for an already-enrolled visitor.
+
+        Keeps the known name and skips the name question; the same prompts are
+        re-read, then the new takes are folded into the existing voiceprint so
+        recognition gets more accurate.
+        """
+        with session.lock:
+            if session.stage != "chat" or session.voiceprint is None:
+                return {"ok": False, "reason": "enrol your voice first", **session.state()}
+            session.mode = "add"
+            session.stage = "prompts"
+            session.prompt_index = 0
+            session.takes = []
+        prompt = session.current_prompt
+        return {
+            "ok": True, "stage": "prompts", "mode": "add", "name": session.name,
+            "prompt": prompt, "prompt_audio": self._say(prompt), **session.state(),
+        }
 
     def ask(self, session: DemoSession, b64: str, mime: str, miccheck: bool = False) -> dict:
         if session.stage != "chat" or session.gate is None:
@@ -849,8 +1038,6 @@ class DemoStore:
             }
 
     def timeout_sweep(self) -> None:
-        if not bool(self.cfg.timeout.enabled):
-            return  # auto-sleep turned off in Settings
         minutes = float(self.cfg.timeout.minutes)
         cutoff = time.time() - minutes * 60
         with self._lock:
@@ -869,8 +1056,9 @@ cfg = load_config()
 # Cloud hosts inject configuration as environment variables, not a `.env` file.
 # load_config() only reads the `.env` file, so merge real process env vars here
 # (OPENAI_* doubles as the Groq/any OpenAI-compatible backend — see README).
-for _key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
-             "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"):
+for _key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_ASR_MODEL",
+             "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "TTS_VOICE",
+             "PICOVOICE_ACCESS_KEY", "EAGLE_THRESHOLD"):
     _val = os.environ.get(_key)
     if _val:
         cfg.env[_key] = _val.strip()
@@ -879,7 +1067,8 @@ STORE = DemoStore(cfg)
 
 def _sweep() -> None:
     while True:
-        time.sleep(30)
+        # Keep the one-minute sleep timer accurate to within a few seconds.
+        time.sleep(5)
         try:
             STORE.timeout_sweep()
             STORE.ttl_sweep()
@@ -924,7 +1113,7 @@ def api_start(payload: dict):
 
 @app.post("/api/demo/settings")
 def api_settings(payload: dict):
-    """Update the approved settings (sleep timer, auto-sleep) for the live app."""
+    """Update the live app's single setting: idle time before sleep."""
     try:
         STORE.update_settings(payload)
         session = STORE.get(payload.get("sid"))
@@ -936,11 +1125,11 @@ def api_settings(payload: dict):
 
 @app.post("/api/demo/tts")
 def api_tts(payload: dict):
-    """Synthesise a reply with the system voice (the original Lyra voice).
+    """Synthesise a reply with the neural voice (edge-tts API, `say` fallback).
 
     The conversation reply itself is returned as text first (fast), then the
     browser asks for the audio here. Audio is sent as MP3 so it crosses the
-    tunnel quickly; the voice is still the same macOS `say` voice.
+    tunnel quickly.
     """
     text = str(payload.get("text") or "").strip()[:800]
     if not text:
@@ -977,6 +1166,17 @@ def api_enrol(payload: dict):
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
 
 
+@app.post("/api/demo/add")
+def api_add(payload: dict):
+    """Start adding more voice samples to the current voiceprint."""
+    session = STORE.get(payload.get("sid"))
+    try:
+        return STORE.add_samples_start(session)
+    except Exception as e:
+        log.exception("team add-samples failed")
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
 @app.post("/api/demo/ask")
 def api_ask(payload: dict):
     session = STORE.get(payload.get("sid"))
@@ -995,14 +1195,22 @@ def api_ask(payload: dict):
 @app.get("/")
 def index():
     html = (UI_DIR / "index.html").read_text()
-    if THRESHOLD_CONTROL not in html:
-        if ANCHOR_CONTROL in html:
-            html = html.replace(ANCHOR_CONTROL, THRESHOLD_CONTROL + ANCHOR_CONTROL)
-        else:
-            html = html.replace(
-                '<div class="settings-grid">',
-                '<div class="settings-grid">\n' + THRESHOLD_CONTROL,
-            )
+    # Keep approved ui/index.html untouched; tailor only the live response.
+    html = html.replace("Stop after (minutes)", "Sleep after idle (minutes)")
+    html = html.replace(
+        '          <label class="toggle"><input type="checkbox" id="timeout-enabled" /> auto-sleep when idle</label>\n',
+        "",
+    )
+    html = html.replace(
+        '          <label class="toggle"><input type="checkbox" id="saveutt" /> save audio to <code>debug/</code></label>\n',
+        "",
+    )
+    # The live app now sends audio to Groq (speech-to-text) and text to the TTS
+    # service, so the consent wording must reflect that instead of "never uploaded".
+    html = html.replace(
+        "I understand my voice stays on this device and is never uploaded.",
+        "I understand my voice is sent to the assistant (including cloud speech services) for processing.",
+    )
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
