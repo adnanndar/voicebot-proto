@@ -608,6 +608,7 @@ function handleAskResult(res) {
   if (res.owner === false) {
     // Background voices and noise: ignore this one utterance and keep listening
     // for the owner. The live app never locks out, so it is never paused.
+    if (res.decision === "ignored" && res.reason) toast(res.reason);
     showScore(res.score, false);
     conversationOpen = !!res.conversation_open;
     processing = false;
@@ -726,7 +727,7 @@ $("#btn-enrol").addEventListener("click", async () => {
   try {
     busy = true;
     addingSamples = false;
-    const res = await api("/api/demo/start", { sid });
+    const res = await api("/api/demo/start", { sid, consent: true });
     enrolOpen = true;
     lastPrompt = "";
     $("#enrol-result").textContent = "";
@@ -740,10 +741,20 @@ $("#btn-enrol").addEventListener("click", async () => {
 
 $("#btn-add").addEventListener("click", async () => {
   if (stage !== "chat") { toast("Enrol your voice first, then add samples.", true); return; }
+  const consent = $("#enrol-consent");
+  if (consent && !consent.checked) {
+    toast("Please tick the consent box before adding voice samples.", true);
+    return;
+  }
   try {
     busy = true;
     addingSamples = true;
-    const res = await api("/api/demo/add", { sid });
+    const res = await api("/api/demo/add", { sid, consent: true });
+    if (!res.ok) {
+      addingSamples = false;
+      toast(res.reason || "Could not add voice samples.", true);
+      return;
+    }
     enrolOpen = true;
     lastPrompt = "";
     $("#enrol-result").textContent = "Read each line aloud to sharpen recognition.";
@@ -785,7 +796,7 @@ $("#btn-delete").addEventListener("click", async () => {
   if (!confirm("Start over? Your voice and conversation for this session will be cleared.")) return;
   try {
     if (listening) stopListening();
-    const res = await api("/api/demo/start", { sid });
+    const res = await api("/api/demo/reset", { sid });
     enrolOpen = false;
     localStorage.removeItem(SID_KEY);
     sid = "";

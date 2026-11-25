@@ -531,6 +531,197 @@ class EagleGate:
         )
 
 
+class DetectifSpeaker:
+    """Speaker enrolment/verification through Detectif's REST API or trial MCP."""
+
+    API = "https://platform.detectif.ai/v1"
+    MCP_TRIAL = "https://platform.detectif.ai/mcp/trial"
+
+    def __init__(self, api_key: str = "", trial: bool = False):
+        self.api_key = api_key.strip()
+        self.trial = bool(trial and not self.api_key)
+
+    @staticmethod
+    def audio_wav(audio: np.ndarray) -> bytes:
+        import soundfile as sf
+
+        a = np.asarray(audio, dtype=np.float32)
+        if a.ndim > 1:
+            a = a.mean(axis=1)
+        buf = io.BytesIO()
+        sf.write(buf, a, 16000, format="WAV", subtype="PCM_16")
+        return buf.getvalue()
+
+    def _mcp_call(self, tool: str, arguments: dict) -> dict:
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": uuid.uuid4().hex,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        }).encode()
+        req = urllib.request.Request(
+            self.MCP_TRIAL, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2025-03-26",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            envelope = json.loads(resp.read().decode("utf-8", "replace"))
+        result = envelope.get("result") or {}
+        content = result.get("structuredContent")
+        if content is None:
+            for item in result.get("content", []):
+                if item.get("type") == "text":
+                    try:
+                        content = json.loads(item.get("text", ""))
+                    except ValueError:
+                        continue
+                    if content is not None:
+                        break
+        if result.get("isError") or not isinstance(content, dict):
+            raise RuntimeError(f"Detectif trial {tool} failed: {content or result}")
+        if content.get("error"):
+            err = content["error"]
+            raise RuntimeError(f"Detectif trial {tool}: {err.get('message', err)}")
+        return content
+
+    def _rest_multipart(self, path: str, fields: dict, wav: bytes) -> dict:
+        boundary = "----lyra" + uuid.uuid4().hex
+        parts = []
+        for name, value in fields.items():
+            parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n".encode()
+            )
+        parts.append(
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n".encode() + wav + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode())
+        req = urllib.request.Request(
+            self.API + path,
+            data=b"".join(parts),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Idempotency-Key": uuid.uuid4().hex,
+                "User-Agent": USER_AGENT,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+
+    def enroll(self, speaker_id: str, display_name: str, audio: np.ndarray) -> dict:
+        duration = len(audio) / 16000
+        if not 15.0 <= duration <= 60.0:
+            raise ValueError(
+                f"Detectif enrolment needs 15–60 seconds of audio; got {duration:.1f}s"
+            )
+        wav = self.audio_wav(audio)
+        if self.trial:
+            data = self._mcp_call("enroll_speaker", {
+                "speaker_id": speaker_id,
+                "display_name": display_name,
+                "audio_base64": base64.b64encode(wav).decode("ascii"),
+                "filename": "voice-enrol.wav",
+                "idempotency_key": uuid.uuid4().hex,
+            })
+        else:
+            data = self._rest_multipart(
+                "/speakers/enroll",
+                {"speaker_id": speaker_id, "display_name": display_name},
+                wav,
+            )
+        speaker = data.get("speaker") or {}
+        return {
+            "speaker_id": speaker.get("speaker_id") or speaker_id,
+            "samples": int(speaker.get("samples", 1)),
+            "data": data,
+        }
+
+    def verify(self, speaker_id: str, audio: np.ndarray) -> dict:
+        duration = len(audio) / 16000
+        if not 3.0 <= duration <= 60.0:
+            raise ValueError(
+                f"Detectif verification needs 3–60 seconds of audio; got {duration:.1f}s"
+            )
+        wav = self.audio_wav(audio)
+        if self.trial:
+            data = self._mcp_call("verify_speaker", {
+                "speaker_id": speaker_id,
+                "audio_base64": base64.b64encode(wav).decode("ascii"),
+                "filename": "voice-verify.wav",
+                "idempotency_key": uuid.uuid4().hex,
+            })
+        else:
+            data = self._rest_multipart(
+                "/speakers/verify", {"speaker_id": speaker_id}, wav
+            )
+        result = data.get("result") or {}
+        return {
+            "decision": result.get("decision"),
+            "similarity": float(result.get("similarity", 0.0)),
+            "threshold": float(result.get("threshold", 0.53)),
+            "data": data,
+        }
+
+    def delete(self, speaker_id: str) -> None:
+        if not speaker_id:
+            return
+        if self.trial:
+            try:
+                self._mcp_call("delete_speaker", {"speaker_id": speaker_id})
+            except Exception as exc:  # noqa: BLE001
+                log.info("trial speaker cleanup skipped: %s", exc)
+            return
+        req = urllib.request.Request(
+            f"{self.API}/speakers/{speaker_id}",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": USER_AGENT,
+            },
+            method="DELETE",
+        )
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+
+
+class DetectifGate:
+    """Detectif-backed speaker gate, kept compatible with the existing ask flow."""
+
+    def __init__(self, client: DetectifSpeaker, speaker_id: str):
+        self.client = client
+        self.speaker_id = speaker_id
+        self.display_threshold = (0.53 + 1.0) / 2.0
+
+    def decide(self, utt: Utterance) -> Decision:
+        try:
+            result = self.client.verify(self.speaker_id, utt.audio)
+        except ValueError as exc:
+            return Decision(False, None, "ignored", str(exc), "short")
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            lowered = message.lower()
+            if any(word in lowered for word in ("too short", "insufficient speech", "at least 2 seconds", "3–60 seconds")):
+                return Decision(False, None, "ignored", message, "short")
+            log.warning("detectif verification failed: %s", exc)
+            return Decision(False, None, "not_owner", "speaker check unavailable", "detectif")
+        raw = result["similarity"]  # Detectif score is [-1, 1], not a percentage.
+        self.display_threshold = (result["threshold"] + 1.0) / 2.0
+        display_score = max(0.0, min(1.0, (raw + 1.0) / 2.0))
+        owner = result["decision"] == "match"
+        return Decision(
+            owner, round(display_score, 4),
+            "owner" if owner else "not_owner",
+            f"Detectif decision: {result['decision']}; similarity {raw:.3f}",
+            "detectif",
+        )
+
+
 class DemoSession:
     def __init__(self, sid: str, prompts: list[dict], cfg: AttrDict):
         self.id = sid
@@ -545,6 +736,9 @@ class DemoSession:
         self.meta: dict | None = None
         self.gate: SpeakerGate | None = None
         self.enrol_clips: list[np.ndarray] = []  # kept for Eagle "add samples"
+        self.detectif_speaker_id: str | None = None
+        self.speaker_provider = "ecapa"
+        self.consented = False
         self.conversation_open = False
         self.history: list[tuple[str, str]] = []
         self.lock = threading.Lock()
@@ -560,11 +754,17 @@ class DemoSession:
         return ""
 
     def state(self) -> dict:
+        score_threshold = (
+            self.gate.display_threshold
+            if isinstance(self.gate, DetectifGate)
+            else float(self.cfg.gate.accept_threshold)
+        )
         return {
             "sid": self.id,
             "stage": self.stage,
             "mode": self.mode,
             "name": self.name,
+            "speaker_provider": self.speaker_provider,
             "prompt": self.current_prompt if self.stage == "prompts" else (
                 NAME_QUESTION if self.stage == "name" else ""
             ),
@@ -577,7 +777,7 @@ class DemoSession:
             ],
             # Same settings the approved app exposes (sleep timer, owner rule).
             "settings": {
-                "accept_threshold": float(self.cfg.gate.accept_threshold),
+                "accept_threshold": float(score_threshold),
                 "reject_threshold": float(self.cfg.gate.reject_threshold),
                 "conversation_window_sec": float(self.cfg.gate.conversation_window_sec),
                 "timeout_minutes": float(self.cfg.timeout.minutes),
@@ -694,11 +894,19 @@ class DemoStore:
         # owner phrase must still be scored and answered rather than silently
         # "ignored". MIN_SECONDS (0.4 s) already guards against empty clips.
         self.cfg.gate.min_utterance_sec = 0.2
-        # Speaker recognition: use Picovoice Eagle (free, on-device, no torch)
-        # when a key is configured; otherwise keep ECAPA exactly as before.
+        # Speaker provider preference: Detectif API/trial, then Eagle, then ECAPA.
+        self.detectif_key = (cfg.env.get("DETECTIF_API_KEY") or "").strip()
+        self.detectif_trial = str(
+            cfg.env.get("DETECTIF_USE_TRIAL", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.use_detectif = bool(self.detectif_key or self.detectif_trial)
+        self._detectif = (
+            DetectifSpeaker(self.detectif_key, trial=self.detectif_trial)
+            if self.use_detectif else None
+        )
         self.eagle_key = (cfg.env.get("PICOVOICE_ACCESS_KEY") or "").strip()
         self.eagle_threshold = float(cfg.env.get("EAGLE_THRESHOLD") or 0.4)
-        self.use_eagle = bool(self.eagle_key)
+        self.use_eagle = bool(self.eagle_key) and not self.use_detectif
         self._eagle = EagleSpeaker(self.eagle_key, self.eagle_threshold) if self.use_eagle else None
         self._sessions: dict[str, DemoSession] = {}
         self._lock = threading.Lock()
@@ -756,18 +964,33 @@ class DemoStore:
             raise RuntimeError("no prompts available")
         sid = uuid.uuid4().hex
         session = DemoSession(sid, prompts, self.cfg)
+        if self.use_detectif:
+            session.speaker_provider = "detectif"
+        elif self.use_eagle:
+            session.speaker_provider = "eagle"
+        removed: list[DemoSession] = []
         with self._lock:
-            self._prune_locked()
+            removed.extend(self._prune_locked())
             if len(self._sessions) >= MAX_SESSIONS:
                 oldest = min(self._sessions.values(), key=lambda s: s.seen)
-                self._sessions.pop(oldest.id, None)
+                removed.append(self._sessions.pop(oldest.id))
             self._sessions[sid] = session
+        for old in removed:
+            self._delete_detectif_profile(old)
         return session
 
-    def _prune_locked(self) -> None:
+    def _prune_locked(self) -> list[DemoSession]:
         cutoff = time.time() - SESSION_TTL
-        for sid in [s.id for s in self._sessions.values() if s.seen < cutoff]:
-            self._sessions.pop(sid, None)
+        stale_ids = [s.id for s in self._sessions.values() if s.seen < cutoff]
+        return [self._sessions.pop(sid) for sid in stale_ids]
+
+    def _delete_detectif_profile(self, session: DemoSession) -> None:
+        if self.use_detectif and session.detectif_speaker_id:
+            try:
+                self._detectif.delete(session.detectif_speaker_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not delete Detectif profile %s: %s",
+                            session.detectif_speaker_id, exc)
 
     def get(self, sid: str | None) -> DemoSession:
         if sid:
@@ -779,9 +1002,12 @@ class DemoStore:
         return self._new()
 
     def reset(self, sid: str | None) -> DemoSession:
+        removed = None
         if sid:
             with self._lock:
-                self._sessions.pop(sid, None)
+                removed = self._sessions.pop(sid, None)
+        if removed:
+            self._delete_detectif_profile(removed)
         return self._new()
 
     def update_settings(self, payload: dict) -> None:
@@ -821,6 +1047,28 @@ class DemoStore:
         if len(audio) / 16000 > MAX_SECONDS:
             raise ValueError("that recording is too long — keep it under 30 seconds")
         return audio
+
+    def _detectif_enrol_audio(self, takes: list[np.ndarray]) -> np.ndarray:
+        """Join the 10 short enrolment prompts into Detectif's required sample."""
+        parts = []
+        pause = np.zeros(int(0.15 * 16000), dtype=np.float32)
+        remaining = 60 * 16000
+        for take in takes:
+            if remaining <= 0:
+                break
+            speech = trim_to_speech(take, 16000)
+            speech = np.asarray(speech, dtype=np.float32).reshape(-1)
+            if speech.size == 0:
+                continue
+            speech = speech[:remaining]
+            parts.append(speech)
+            remaining -= len(speech)
+            if remaining > len(pause):
+                parts.append(pause)
+                remaining -= len(pause)
+        if not parts:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(parts).astype(np.float32)
 
     def enrol(self, session: DemoSession, b64: str, mime: str) -> dict:
         audio = prep_enrol_audio(self._audio(b64, mime))
@@ -865,7 +1113,38 @@ class DemoStore:
             session.prompt_index += 1
 
             if session.prompt_index >= len(session.prompts):
-                if self.use_eagle:
+                if self.use_detectif:
+                    clips = session.takes
+                    detectif_audio = self._detectif_enrol_audio(clips)
+                    speaker_id = (
+                        session.detectif_speaker_id
+                        if session.mode == "add" and session.detectif_speaker_id
+                        else f"lyra-{session.id[:32]}"
+                    )
+                    try:
+                        enrolled = self._detectif.enroll(
+                            speaker_id, session.name or "Lyra visitor", detectif_audio
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Detectif enrol failed")
+                        return {
+                            "ok": False,
+                            "reason": f"Detectif enrolment failed: {exc}",
+                            **session.state(),
+                        }
+                    session.detectif_speaker_id = enrolled["speaker_id"]
+                    session.speaker_provider = "detectif"
+                    session.meta = {"num_samples": enrolled["samples"]}
+                    session.gate = DetectifGate(
+                        self._detectif, session.detectif_speaker_id
+                    )
+                    session.enrol_clips = clips
+                    done_note = (
+                        "Added samples — recognition is sharper now."
+                        if session.mode == "add"
+                        else f"Nice to meet you, {session.name}. Ask me anything."
+                    )
+                elif self.use_eagle:
                     # Picovoice Eagle: build/refresh a compact speaker profile.
                     clips = (
                         session.enrol_clips + session.takes
@@ -882,6 +1161,7 @@ class DemoStore:
                         self._eagle, profile_bytes, self.cfg.gate.min_utterance_sec
                     )
                     session.enrol_clips = clips
+                    session.speaker_provider = "eagle"
                     done_note = (
                         "Added samples — recognition is sharper now."
                         if session.mode == "add"
@@ -901,6 +1181,7 @@ class DemoStore:
                     session.voiceprint = vec
                     session.meta = meta
                     session.gate = SpeakerGate(self.cfg, vec)
+                    session.speaker_provider = "ecapa"
                 session.stage = "chat"
                 session.mode = "enrol"
                 session.takes = []
@@ -928,7 +1209,17 @@ class DemoStore:
         recognition gets more accurate.
         """
         with session.lock:
-            if session.stage != "chat" or session.voiceprint is None:
+            if self.use_detectif and self.detectif_trial:
+                return {
+                    "ok": False,
+                    "reason": "Add samples requires a Detectif account API key; the no-key trial cannot maintain reusable profiles.",
+                    **session.state(),
+                }
+            has_profile = (
+                bool(session.detectif_speaker_id)
+                if self.use_detectif else session.voiceprint is not None
+            )
+            if session.stage != "chat" or not has_profile:
                 return {"ok": False, "reason": "enrol your voice first", **session.state()}
             session.mode = "add"
             session.stage = "prompts"
@@ -953,11 +1244,23 @@ class DemoStore:
             }
         session.asks.append(now)
 
-        audio = trim_to_speech(self._audio(b64, mime), 16000)
-        if len(audio) / 16000 < MIN_SECONDS:
+        captured_audio = self._audio(b64, mime)
+        # Detectif validates both total clip length and voiced-speech length;
+        # keep the original clip (including its trailing pause) for its check.
+        audio = (
+            captured_audio
+            if isinstance(session.gate, DetectifGate)
+            else trim_to_speech(captured_audio, 16000)
+        )
+        min_clip = 3.0 if isinstance(session.gate, DetectifGate) else MIN_SECONDS
+        if len(audio) / 16000 < min_clip:
             return {
                 "ok": False, "owner": False,
-                "reason": "too short — hold the button and speak a full sentence",
+                "reason": (
+                    "Detectif needs at least 3 seconds of audio and 2 seconds of speech."
+                    if isinstance(session.gate, DetectifGate)
+                    else "too short — hold the button and speak a full sentence"
+                ),
                 **session.state(),
             }
 
@@ -1048,7 +1351,9 @@ class DemoStore:
 
     def ttl_sweep(self) -> None:
         with self._lock:
-            self._prune_locked()
+            removed = self._prune_locked()
+        for session in removed:
+            self._delete_detectif_profile(session)
 
 
 # ----------------------------------------------------------------------- server
@@ -1058,7 +1363,8 @@ cfg = load_config()
 # (OPENAI_* doubles as the Groq/any OpenAI-compatible backend — see README).
 for _key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_ASR_MODEL",
              "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "TTS_VOICE",
-             "PICOVOICE_ACCESS_KEY", "EAGLE_THRESHOLD"):
+             "PICOVOICE_ACCESS_KEY", "EAGLE_THRESHOLD", "DETECTIF_API_KEY",
+             "DETECTIF_USE_TRIAL"):
     _val = os.environ.get(_key)
     if _val:
         cfg.env[_key] = _val.strip()
@@ -1106,9 +1412,22 @@ def api_session(sid: str | None = None):
 
 @app.post("/api/demo/start")
 def api_start(payload: dict):
+    if not bool(payload.get("consent")):
+        return JSONResponse(
+            {"ok": False, "reason": "consent is required before enrolment"},
+            status_code=403,
+        )
     session = STORE.reset(payload.get("sid"))
+    session.consented = True
     question = NAME_QUESTION
     return {"ok": True, "question": question, "audio": STORE.speak(question), **session.state()}
+
+
+@app.post("/api/demo/reset")
+def api_reset(payload: dict):
+    """Clear this visitor's profile without starting a new enrolment."""
+    session = STORE.reset(payload.get("sid"))
+    return {"ok": True, **session.state()}
 
 
 @app.post("/api/demo/settings")
@@ -1150,6 +1469,11 @@ def api_tts(payload: dict):
 @app.post("/api/demo/enrol")
 def api_enrol(payload: dict):
     session = STORE.get(payload.get("sid"))
+    if not session.consented:
+        return JSONResponse(
+            {"ok": False, "reason": "consent is required before enrolment", **session.state()},
+            status_code=403,
+        )
     try:
         result = STORE.enrol(session, payload.get("audio", ""), payload.get("mime", ""))
         log.info(
@@ -1170,6 +1494,12 @@ def api_enrol(payload: dict):
 def api_add(payload: dict):
     """Start adding more voice samples to the current voiceprint."""
     session = STORE.get(payload.get("sid"))
+    if not bool(payload.get("consent")):
+        return JSONResponse(
+            {"ok": False, "reason": "consent is required before adding voice samples", **session.state()},
+            status_code=403,
+        )
+    session.consented = True
     try:
         return STORE.add_samples_start(session)
     except Exception as e:
@@ -1205,11 +1535,15 @@ def index():
         '          <label class="toggle"><input type="checkbox" id="saveutt" /> save audio to <code>debug/</code></label>\n',
         "",
     )
-    # The live app now sends audio to Groq (speech-to-text) and text to the TTS
-    # service, so the consent wording must reflect that instead of "never uploaded".
+    # Browser audio is sent to whichever speech/speaker services are configured.
+    consent_text = (
+        "I consent to sending voice recordings to Detectif.ai for speaker verification and to cloud providers for transcription and replies. Voice profiles and audio may be retained under provider policies."
+        if STORE.use_detectif
+        else "I understand my voice recordings and transcripts may be sent to third-party services for processing and may be retained under provider policies."
+    )
     html = html.replace(
         "I understand my voice stays on this device and is never uploaded.",
-        "I understand my voice is sent to the assistant (including cloud speech services) for processing.",
+        consent_text,
     )
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
